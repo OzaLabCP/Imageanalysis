@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# CellScope outputs / scratch (never commit results or screenshots)
+.preview/
+cellscope_out/
+*.out
+
+# Raw image DATA does not belong in git — keep it in object storage / Globus.
+/data/
+*.tif
+*.tiff
+*.nd2
+*.czi
+*.lif
+*.ome.tif
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
