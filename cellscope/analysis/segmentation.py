@@ -91,18 +91,26 @@ def segment_frame(
     labels, n = ndi.label(mask)
     if n == 0:
         return labels.astype(np.int32)
+    return relabel_min_size(labels, min_size)
 
-    if min_size and min_size > 0:
-        sizes = np.bincount(labels.ravel())
-        sizes[0] = 0
-        keep = sizes >= int(min_size)
-        # Renumber kept labels to a contiguous 1..k range.
-        remap = np.zeros(n + 1, dtype=np.int32)
-        kept_ids = np.nonzero(keep)[0]
-        remap[kept_ids] = np.arange(1, kept_ids.size + 1, dtype=np.int32)
-        labels = remap[labels]
 
-    return labels.astype(np.int32)
+def relabel_min_size(labels: np.ndarray, min_size: int) -> np.ndarray:
+    """Drop objects smaller than ``min_size`` pixels and renumber to 1..k.
+
+    Works on any label image (threshold output or Cellpose masks), so every
+    engine produces contiguous labels with the same speck-removal behavior.
+    """
+    labels = labels.astype(np.int32, copy=False)
+    max_id = int(labels.max())
+    if max_id == 0:
+        return labels
+    sizes = np.bincount(labels.ravel(), minlength=max_id + 1)
+    sizes[0] = 0
+    keep = sizes >= max(1, int(min_size))
+    kept_ids = np.nonzero(keep)[0]
+    remap = np.zeros(max_id + 1, dtype=np.int32)
+    remap[kept_ids] = np.arange(1, kept_ids.size + 1, dtype=np.int32)
+    return remap[labels]
 
 
 def centroids_of(labels: np.ndarray) -> np.ndarray:

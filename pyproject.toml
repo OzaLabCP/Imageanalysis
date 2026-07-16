@@ -18,6 +18,12 @@ dependencies = [
     "Pillow>=10.0",
 ]
 
+[project.optional-dependencies]
+# GPU deep-learning segmentation. Install on a machine with an NVIDIA GPU, and
+# install a CUDA build of torch first (see https://pytorch.org):
+#   pip install "cellscope[cellpose]"
+cellpose = ["cellpose>=4.0"]
+
 [project.scripts]
 cellscope = "cellscope.app:main"
 cellscope-batch = "cellscope.batch:main"

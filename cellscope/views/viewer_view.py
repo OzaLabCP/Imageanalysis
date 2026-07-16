@@ -441,6 +441,21 @@ class ViewerView(QWidget):
         av.setContentsMargins(0, 0, 0, 0)
         av.setSpacing(14)
 
+        # Segmentation engine (Cellpose only shown if it is installed).
+        from cellscope.analysis import available_engines
+        engines = available_engines()
+        engine_seg = None
+        if len(engines) > 1:
+            eng_label = QLabel("Segmentation engine")
+            eng_label.setObjectName("SectionLabel")
+            av.addWidget(eng_label)
+            engine_seg = SegmentedControl([e.title() for e in engines])
+            try:
+                engine_seg.set_current_index(engines.index(s.engine), emit=False)
+            except ValueError:
+                pass
+            av.addWidget(engine_seg)
+
         names = self.state.loader.channel_names if self.state.loader else ["Channel 1"]
         chan_label = QLabel("Detect on channel")
         chan_label.setObjectName("SectionLabel")
@@ -470,6 +485,7 @@ class ViewerView(QWidget):
         v.addWidget(run_btn)
 
         def read_settings() -> AnalysisSettings:
+            engine = engines[engine_seg.current_index()] if engine_seg else "threshold"
             return AnalysisSettings(
                 sensitivity=sensitivity.value(),
                 smoothing=smoothing.value() * 4.0,
@@ -477,6 +493,10 @@ class ViewerView(QWidget):
                 seg_channel=chan_seg.current_index(),
                 z=self.state.z,
                 max_distance=5.0 + distance.value() * 75.0,
+                engine=engine,
+                cellpose_model=s.cellpose_model,
+                cellpose_diameter=s.cellpose_diameter,
+                cellpose_gpu=s.cellpose_gpu,
             )
 
         return wrap, read_settings

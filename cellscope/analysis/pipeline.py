@@ -14,8 +14,9 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from cellscope.analysis.engines import get_engine
 from cellscope.analysis.quantify import measure_frame
-from cellscope.analysis.segmentation import centroids_of, segment_frame
+from cellscope.analysis.segmentation import centroids_of
 from cellscope.analysis.tracking import track_centroids
 from cellscope.data.loader import DatasetLoader
 
@@ -25,12 +26,18 @@ class AnalysisSettings:
     """Everything that controls a run. Only ``sensitivity`` is surfaced by default;
     the rest live behind the Advanced sheet with sensible defaults."""
 
-    sensitivity: float = 0.5      # the single primary control (0..1)
-    smoothing: float = 1.5        # Gaussian sigma (px)
+    sensitivity: float = 0.5      # threshold engine's single control (0..1)
+    smoothing: float = 1.5        # Gaussian sigma (px), threshold engine
     min_size: int = 25            # drop specks smaller than this (px)
     seg_channel: int = 0          # channel used to find cells
     z: int = 0                    # Z slice analysed (M1 is 2D + time)
     max_distance: float = 30.0    # tracking gate (px)
+
+    # Segmentation engine: "threshold" (default, CPU) or "cellpose" (GPU).
+    engine: str = "threshold"
+    cellpose_model: str = ""      # "" = Cellpose default (cpsam); or a model name
+    cellpose_diameter: float = 0.0  # 0 = let Cellpose estimate
+    cellpose_gpu: bool = True
 
     def copy(self) -> "AnalysisSettings":
         return AnalysisSettings(
@@ -40,6 +47,10 @@ class AnalysisSettings:
             seg_channel=self.seg_channel,
             z=self.z,
             max_distance=self.max_distance,
+            engine=self.engine,
+            cellpose_model=self.cellpose_model,
+            cellpose_diameter=self.cellpose_diameter,
+            cellpose_gpu=self.cellpose_gpu,
         )
 
 
@@ -114,20 +125,14 @@ def run_analysis(
     z = int(np.clip(settings.z, 0, n_z - 1))
     seg_c = int(np.clip(settings.seg_channel, 0, n_chan - 1))
 
-    # --- detect + collect centroids per frame -----------------------------
-    frame_labels: list[np.ndarray] = []
-    centroids: list[np.ndarray] = []
-    for t in range(n_time):
-        frame = arr[t, z]  # (C, Y, X)
-        labels = segment_frame(
-            frame[seg_c],
-            sensitivity=settings.sensitivity,
-            smoothing=settings.smoothing,
-            min_size=settings.min_size,
-        )
-        frame_labels.append(labels)
-        centroids.append(centroids_of(labels))
-        report(2 + int(58 * (t + 1) / n_time))  # 2..60
+    # --- detect (via the chosen engine) + collect centroids per frame -----
+    seg_frames = [arr[t, z, seg_c] for t in range(n_time)]
+    engine = get_engine(settings.engine)
+    frame_labels = engine.segment_stack(
+        seg_frames, settings, progress=lambda fr: report(2 + int(58 * fr)),
+    )
+    centroids = [centroids_of(labels) for labels in frame_labels]
+    report(60)
 
     # --- track ------------------------------------------------------------
     assignment, tracks = track_centroids(centroids, max_distance=settings.max_distance)

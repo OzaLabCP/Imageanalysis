@@ -76,6 +76,17 @@ def test_resume_skips_existing():
         assert "1 skipped" in b.stdout, b.stdout
 
 
+def test_cellpose_engine_guarded():
+    # Without cellpose installed, --engine cellpose must fail with a clear message.
+    from cellscope.analysis import cellpose_available
+    if cellpose_available():
+        return  # can't exercise the absence path when it's installed
+    r = _run(["__mock__", "-o", "unused", "--engine", "cellpose", "--positions", "A1"])
+    assert r.returncode != 0
+    assert "cellpose" in (r.stderr + r.stdout).lower() and \
+        "not installed" in (r.stderr + r.stdout).lower()
+
+
 if __name__ == "__main__":
     test_batch_is_headless()
     print("[ok] headless (no Qt)")
@@ -85,4 +96,6 @@ if __name__ == "__main__":
     print("[ok] parallel run + combined CSV with region column")
     test_resume_skips_existing()
     print("[ok] --resume skips existing")
+    test_cellpose_engine_guarded()
+    print("[ok] cellpose engine guarded when not installed")
     print("All batch checks passed")

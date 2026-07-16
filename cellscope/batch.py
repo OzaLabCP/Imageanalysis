@@ -23,7 +23,12 @@ import sys
 import time
 from pathlib import Path
 
-from cellscope.analysis import AnalysisSettings, run_analysis
+from cellscope.analysis import (
+    AnalysisSettings,
+    available_engines,
+    cellpose_available,
+    run_analysis,
+)
 from cellscope.data import CephlaLoader, FolderLoader, MockLoader
 from cellscope.export import measurements_header, write_measurements_csv
 
@@ -110,6 +115,14 @@ def main(argv=None) -> int:
                     help="Analyze at 1/N resolution for speed (measurements stay in microns)")
     ap.add_argument("--pixel-size", type=float, default=None,
                     help="Microns per full-res pixel (default: from the acquisition metadata)")
+    ap.add_argument("--engine", default="threshold", choices=["threshold", "cellpose"],
+                    help="Segmentation engine (cellpose needs a GPU install)")
+    ap.add_argument("--cellpose-model", default="",
+                    help="Cellpose model name ('' = default cpsam)")
+    ap.add_argument("--cellpose-diameter", type=float, default=0.0,
+                    help="Expected cell diameter in px (0 = auto)")
+    ap.add_argument("--no-gpu", action="store_true",
+                    help="Run Cellpose on CPU (slow) instead of GPU")
     ap.add_argument("--sensitivity", type=float, default=0.5)
     ap.add_argument("--smoothing", type=float, default=1.5)
     ap.add_argument("--min-size", type=int, default=25)
@@ -137,19 +150,37 @@ def main(argv=None) -> int:
         print("No matching positions.", file=sys.stderr)
         return 1
 
+    if args.engine == "cellpose" and not cellpose_available():
+        print("Cellpose engine requested but 'cellpose' is not installed. On the "
+              "GPU machine: pip install 'cellscope[cellpose]' plus a CUDA build of "
+              "torch. Available engines: " + ", ".join(available_engines()),
+              file=sys.stderr)
+        return 1
+
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    jobs = args.jobs if args.jobs > 0 else min(mp.cpu_count() or 1, 8)
+    # Cellpose holds a GPU model per process, so default to ONE worker (the GPU
+    # parallelizes internally by batching frames); the threshold engine scales
+    # across CPU cores.
+    if args.jobs > 0:
+        jobs = args.jobs
+    elif args.engine == "cellpose":
+        jobs = 1
+    else:
+        jobs = min(mp.cpu_count() or 1, 8)
     settings_kw = dict(
         sensitivity=args.sensitivity, smoothing=args.smoothing,
         min_size=args.min_size, seg_channel=args.seg_channel,
         max_distance=args.max_distance,
+        engine=args.engine, cellpose_model=args.cellpose_model,
+        cellpose_diameter=args.cellpose_diameter, cellpose_gpu=not args.no_gpu,
     )
     initargs = (args.folder, settings_kw, args.pixel_size, args.downsample,
                 str(out_dir), args.resume)
 
-    print(f"CellScope batch: {len(wells)} positions, {jobs} worker(s), "
-          f"downsample 1/{args.downsample}, out={out_dir}", flush=True)
+    gpu_note = (" (GPU)" if not args.no_gpu else " (CPU)") if args.engine == "cellpose" else ""
+    print(f"CellScope batch: {len(wells)} positions, engine={args.engine}{gpu_note}, "
+          f"{jobs} worker(s), downsample 1/{args.downsample}, out={out_dir}", flush=True)
     t0 = time.time()
     results = []
 

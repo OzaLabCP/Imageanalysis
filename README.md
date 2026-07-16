@@ -159,6 +159,40 @@ positions / workers)*. Segmentation is CPU-bound today; a GPU segmenter
 
 ---
 
+## Better masks with Cellpose (local GPU)
+
+Segmentation is **pluggable**. The default `threshold` engine (Gaussian + Otsu)
+needs no GPU and runs anywhere, but for dense or varied objects (e.g. polydisperse
+droplets) the deep-learning **Cellpose** engine gives far better masks. Run it on
+a machine with an **NVIDIA GPU**, with the data on that machine's local disk — so
+nothing has to be transferred to a remote GPU.
+
+**Install (on the GPU machine, once):**
+```bash
+# 1) a CUDA build of PyTorch for your GPU  (see https://pytorch.org for the exact line)
+pip install torch --index-url https://download.pytorch.org/whl/cu124
+# 2) CellScope with the Cellpose extra
+pip install "cellscope[cellpose]"
+```
+
+**Run it — headless batch:**
+```bash
+cellscope-batch "/data/exp" -o results --engine cellpose --combine
+cellscope-batch "/data/exp" --engine cellpose --cellpose-diameter 40   # if you know the cell size
+```
+With `--engine cellpose` the runner defaults to **one worker** (the GPU parallelizes
+internally by batching a position's frames); the `threshold` engine scales across
+CPU cores instead. Measurements come out identically in real microns either way.
+
+**In the app:** the Detect sheet's *Advanced options* shows a **Segmentation engine**
+choice (Threshold / Cellpose) whenever Cellpose is installed.
+
+*The current Cellpose default is the size-agnostic Cellpose-SAM model (v4). No GPU
+on a plain laptop is needed for the threshold engine or to browse results — only for
+running Cellpose itself.*
+
+---
+
 ## Project layout
 
 ```

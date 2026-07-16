@@ -2,6 +2,7 @@
 methods (Cellpose, StarDist, btrack) can be swapped in without UI changes.
 """
 
+from cellscope.analysis.engines import available_engines, cellpose_available
 from cellscope.analysis.pipeline import (
     AnalysisSettings,
     CellMeasurement,
@@ -14,4 +15,6 @@ __all__ = [
     "CellMeasurement",
     "WellAnalysis",
     "run_analysis",
+    "available_engines",
+    "cellpose_available",
 ]
