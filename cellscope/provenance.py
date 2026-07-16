@@ -12,11 +12,34 @@ No Qt / heavy dependencies, so it is safe to import in headless / cluster runs.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 from dataclasses import asdict, is_dataclass
 
 from cellscope import __version__
 
 RUN_METADATA_NAME = "run_metadata.json"
+
+
+def _git_revision() -> str | None:
+    """Best-effort git commit (short SHA, with ``+dirty``) of the installed code.
+
+    ``__version__`` alone can't tell two builds apart - both branches report
+    0.1.0 despite different output schemas - so record the commit when the code
+    is a checkout (e.g. an editable install)."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        sha = subprocess.check_output(
+            ["git", "-C", root, "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL, timeout=3).decode().strip()
+        if not sha:
+            return None
+        dirty = subprocess.call(
+            ["git", "-C", root, "diff", "--quiet"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+        return sha + ("+dirty" if dirty else "")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
 
 
 def build_run_metadata(
@@ -50,6 +73,7 @@ def build_run_metadata(
 
     meta = {
         "cellscope_version": __version__,
+        "cellscope_git": _git_revision(),
         "created_utc": created_utc,
         "source": str(source),
         "output_format": output_format,

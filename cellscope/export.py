@@ -96,21 +96,34 @@ _PARQUET_MORPHO = [
 ]
 
 
+# The first 18 columns are the fixed "regionprops-style" reference layout (so a
+# notebook built on that schema still reads by name). ``fov`` and ``condition``
+# are appended because CellScope segments each field of view separately, so
+# ``Label`` restarts at 1 per FOV - without ``fov`` the per-cell key
+# (Well, Timepoint, Label) collides across the FOVs pooled into a well. ``Well``
+# holds the region; the unique per-cell key is (Dataset, Well, fov, Timepoint, Label).
+_PARQUET_KEY_TAIL = ["Eccentricity", "Dataset", "Timepoint", "Well", "fov", "condition"]
+
+
 def parquet_columns(channel_names) -> list[str]:
     """Ordered column names of the parquet schema for a given channel set."""
     cols = ["Label"] + [name for name, _ in _PARQUET_MORPHO]
     for stat, _attr in _PARQUET_STATS:
         cols += [f"Intensity {stat} ({n})" for n in channel_names]
-    cols += ["Eccentricity", "Dataset", "Timepoint", "Well"]
+    cols += _PARQUET_KEY_TAIL
     return cols
 
 
 def _parquet_column_data(items, channel_names, dataset: str) -> "dict[str, list]":
-    """Build column-oriented data for the parquet schema from analyzed wells."""
+    """Build column-oriented data for the parquet schema from analyzed wells.
+
+    ``items`` is a list of ``(well_id, condition, WellAnalysis)`` (same shape the
+    CSV writer takes, so the two schemas can't drift on identity columns).
+    """
     cols: dict[str, list] = {c: [] for c in parquet_columns(channel_names)}
     n_chan = len(channel_names)
-    for well_id, wa in items:
-        region, _fov = split_region_fov(well_id)
+    for well_id, condition, wa in items:
+        region, fov = split_region_fov(well_id)
         for m in wa.measurements:
             cols["Label"].append(int(m.track_id))
             for name, attr in _PARQUET_MORPHO:
@@ -118,31 +131,33 @@ def _parquet_column_data(items, channel_names, dataset: str) -> "dict[str, list]
             for stat, attr in _PARQUET_STATS:
                 values = getattr(m, attr)
                 for ci in range(n_chan):
-                    v = float(values[ci]) if ci < len(values) else 0.0
+                    v = float(values[ci]) if ci < len(values) else float("nan")
                     cols[f"Intensity {stat} ({channel_names[ci]})"].append(v)
             cols["Eccentricity"].append(float(m.eccentricity))
             cols["Dataset"].append(dataset)
             cols["Timepoint"].append(int(m.frame))  # 0-based, matches the schema
             cols["Well"].append(region)
+            cols["fov"].append(fov)
+            cols["condition"].append(condition or "")
     return cols
 
 
 def write_measurements_parquet(path: str, items, dataset: str = "") -> int:
     """Write the fixed-schema parquet for one or more analyzed wells.
 
-    ``items`` is a list of ``(well_id, WellAnalysis)`` sharing a channel set.
-    ``dataset`` fills the ``Dataset`` column (e.g. the acquisition folder).
-    Returns the number of measurement rows written. Requires ``pyarrow``.
+    ``items`` is a list of ``(well_id, condition, WellAnalysis)`` sharing a
+    channel set. ``dataset`` fills the ``Dataset`` column (e.g. the acquisition
+    folder). Returns the number of measurement rows written. Requires ``pyarrow``.
     """
     pa, pq = _require_pyarrow()
-    items = [(w, wa) for (w, wa) in items if wa is not None]
+    items = [it for it in items if it[2] is not None]
     if not items:
         return 0
-    channel_names = items[0][1].channel_names
+    channel_names = items[0][2].channel_names
     data = _parquet_column_data(items, channel_names, dataset)
 
     int_cols = {"Label", "Timepoint"}
-    str_cols = {"Dataset", "Well"}
+    str_cols = {"Dataset", "Well", "fov", "condition"}
     arrays, names = [], []
     for name in parquet_columns(channel_names):
         values = data[name]

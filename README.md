@@ -153,18 +153,79 @@ Options: `-j/--jobs` (workers), `--positions "B2-*,B3-0"` (glob subset),
 
 Every run also writes a **`run_metadata.json`** provenance sidecar into the output
 folder recording exactly how the results were produced (engine, settings, pixel
-size, resolved GPU device, CellScope version, positions). Comparing two of these
-proves whether two runs were analyzed identically.
+size, resolved GPU device, CellScope version **and git commit**, positions).
+Comparing two of these proves whether two runs were analyzed identically - and the
+git SHA distinguishes two builds that report the same `0.1.0` version but differ in
+output schema.
 
 ### Parquet output (`--format parquet`)
 
 For pipelines built around a fixed "regionprops-style" table, `--format parquet`
-(needs `pip install "cellscope[parquet]"`) writes one row per cell per timepoint
-with a fixed 18-column schema: `Label`, `Diameter (Equivalent) (um)`,
+(needs `pip install "cellscope[parquet]"`) writes one row per cell per timepoint.
+The first **18 columns are the fixed reference schema** (so a notebook built on it
+still reads by name): `Label`, `Diameter (Equivalent) (um)`,
 `Diameter (Feret) (um)`, `Length Major (um)`, `Length Minor (um)`,
 `Perimeter (um)`, per-channel `Intensity Mean/Max/STD/Min (<channel>)`,
-`Eccentricity`, `Dataset`, `Timepoint` (0-based), and `Well` (region, FOV pooled).
-`--combine` writes one `all_measurements.parquet` across positions.
+`Eccentricity`, `Dataset`, `Timepoint` (0-based), and `Well` (region).
+
+Two columns are **appended**: **`fov`** and **`condition`**. CellScope segments
+each field of view separately, so `Label` restarts at 1 per FOV; without `fov` the
+per-cell key `(Well, Timepoint, Label)` silently *collides* across the FOVs pooled
+into a well (two different cells map to one key). The unique per-cell key is
+therefore **`(Dataset, Well, fov, Timepoint, Label)`**. `condition` carries the
+platemap group through so downstream code needn't re-join. `--combine` writes one
+`all_measurements.parquet` across positions.
+
+### Built-in QC (`qc.json`)
+
+Because the pipeline's worst failure mode is emitting *plausible-looking* wrong
+data with no warning, every `--combine`/`--analyze` run writes a **`qc.json`** and
+prints a one-line summary. It flags, at run time, the silent corruption modes:
+
+- **non-unique per-cell keys** (e.g. a missing `fov` column collapsing distinct
+  cells onto one key),
+- rows with a **missing / blank channel** (NaN intensity - an all-zero plane is
+  recorded as absent, *not* as `0.0`, so it can't poison a mean),
+- cells **at or above sensor saturation**, and
+- positions **missing timepoints** or gaps in the timepoint sequence.
+
+The analysis report surfaces the same findings as a banner at the top of
+`report/index.html`, so a data-integrity problem is visible before you read a
+single figure. A clean run prints `QC: no issues found.`
+
+### Automated analysis report (`--analyze` / `cellscope-analyze`)
+
+Turn any run's parquet into a comprehensive **subpopulation report** in one step
+(needs `pip install "cellscope[analysis]"`). It is aimed at *"is there a
+subpopulation that behaves differently - and better - in some conditions?"*, so it
+works at the population/distribution level (a responder subpopulation shows up as
+a second, high mode - not a shift in the mean).
+
+Run it automatically as part of a batch run, or standalone on an existing parquet:
+
+```bash
+cellscope-batch "/data/exp" -o results --engine cellpose --format parquet --analyze \
+    --platemap plate.csv                       # report written to results/report/
+cellscope-analyze results/all_measurements.parquet -o results/report --platemap plate.csv
+```
+
+`--platemap` is an optional CSV with `well,condition` columns (e.g. `H2,Drug A`)
+so every figure is grouped by condition; without it, results group by well. The
+report (`report/index.html`) contains:
+
+- **Fog over time** - per group, one dot per cell, x = time, with the responder gate drawn.
+- **Distributions over time** - per-timepoint violins; two modes reveal a subpopulation.
+- **Responder fraction over time** - the headline: % of cells above a data-driven
+  (Otsu-on-log) gate, per group - directly shows a better-behaving subpopulation
+  growing in some conditions and not others.
+- **Percentile bands** - median vs top decile (p90); a rising tail flags responders.
+- **Responder characterization** - how the high-green cells differ in size / red / shape.
+- **CSV summaries** (`group_timepoint_summary.csv`, `responder_characteristics.csv`)
+  ready for Prism/R/Excel.
+
+The report is population-level: because the parquet pools fields of view, it does
+not follow individual cells' trajectories (add a globally-unique cell id to the
+exporter first if you need true single-cell tracks).
 
 The output CSV includes a **`region`** column (well without the field-of-view
 suffix) so you can pool per well directly in pandas/seaborn. Analyzing positions

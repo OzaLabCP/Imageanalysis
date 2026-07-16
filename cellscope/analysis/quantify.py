@@ -150,6 +150,13 @@ def measure_frame(
     with np.errstate(invalid="ignore", divide="ignore"):
         for c in range(n_channels):
             chan = intensity_cyx[c].astype(np.float64)
+            if not np.any(chan):
+                # An all-zero plane is a missing / not-acquired channel image
+                # (the loader zero-fills gaps). Emitting 0.0 would poison any
+                # mean, so record it as absent (NaN) rather than as data.
+                means[:, c] = totals[:, c] = np.nan
+                maxes[:, c] = mins[:, c] = stds[:, c] = np.nan
+                continue
             totals[:, c] = ndi.sum_labels(chan, label_image, index=ids)
             means[:, c] = ndi.mean(chan, label_image, index=ids)
             maxes[:, c] = ndi.maximum(chan, label_image, index=ids)

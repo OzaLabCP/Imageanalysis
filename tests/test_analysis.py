@@ -183,7 +183,11 @@ def test_parquet_exact_schema():
     wid = loader.list_wells()[0].well_id
     wa = run_analysis(loader, wid, AnalysisSettings())
 
-    expected = [
+    # The first 18 columns are the fixed reference layout (a notebook built on
+    # that schema still reads by name); `fov` and `condition` are appended so the
+    # per-cell key (Dataset, Well, fov, Timepoint, Label) is unique across the
+    # FOVs pooled into a well (Label restarts at 1 per FOV).
+    reference18 = [
         "Label", "Diameter (Equivalent) (um)", "Diameter (Feret) (um)",
         "Length Major (um)", "Length Minor (um)", "Perimeter (um)",
         "Intensity Mean (GFP)", "Intensity Mean (Alexa Fluor 647)",
@@ -192,22 +196,29 @@ def test_parquet_exact_schema():
         "Intensity Min (GFP)", "Intensity Min (Alexa Fluor 647)",
         "Eccentricity", "Dataset", "Timepoint", "Well",
     ]
-    assert parquet_columns(loader.channel_names) == expected
+    expected = reference18 + ["fov", "condition"]
+    cols = parquet_columns(loader.channel_names)
+    assert cols == expected, cols
+    # The reference schema must remain the exact 18-column prefix.
+    assert cols[:18] == reference18
 
     with tempfile.TemporaryDirectory() as td:
         path = str(Path(td) / "p.parquet")
-        n = write_measurements_parquet(path, [(wid, wa)], dataset="src.zarr")
+        n = write_measurements_parquet(path, [(wid, "ctrl", wa)], dataset="src.zarr")
         assert n == len(wa.measurements)
         t = pq.read_table(path)
         assert t.schema.names == expected, t.schema.names
         types = {nm: str(ty) for nm, ty in zip(t.schema.names, t.schema.types)}
         assert types["Label"] == "int64" and types["Timepoint"] == "int64"
         assert types["Dataset"] == "string" and types["Well"] == "string"
+        assert types["fov"] == "string" and types["condition"] == "string"
         assert types["Eccentricity"] == "double"
         # Timepoint is 0-based (unlike the tidy CSV's 1-based `time`).
         assert min(t.column("Timepoint").to_pylist()) == 0
         # Well is the region (FOV suffix stripped); demo wells have no FOV.
         assert set(t.column("Well").to_pylist()) == {wid}
+        # condition is threaded through from the (well, condition, wa) item.
+        assert set(t.column("condition").to_pylist()) == {"ctrl"}
 
 
 def test_provenance_and_device():
@@ -300,6 +311,104 @@ def test_cephla_flat_single_timepoint_folder():
         assert CephlaLoader.looks_like(p2) is False
 
 
+def test_analyze_report():
+    try:
+        import pandas as pd
+        import matplotlib  # noqa: F401
+        import pyarrow  # noqa: F401
+    except ImportError:
+        print("  (skipped analyze report test: pandas/matplotlib not installed)")
+        return
+    import os
+    import tempfile
+
+    from cellscope.analyze import run
+
+    with tempfile.TemporaryDirectory() as d:
+        rng = np.random.default_rng(0)
+        rows = []
+        # H2 grows a high-green subpopulation over time; H3 stays low.
+        for well, fmax in (("H2", 0.5), ("H3", 0.05)):
+            for t in range(3):
+                n = 500
+                resp = rng.random(n) < fmax * (t / 2.0)
+                green = np.where(resp, rng.lognormal(8.6, 0.3, n), rng.lognormal(7.2, 0.4, n))
+                for gv in green:
+                    rows.append((well, t, float(gv), 400.0, 9.0, 0.5))
+        pd.DataFrame(rows, columns=[
+            "Well", "Timepoint", "Intensity Mean (488 nm)",
+            "Intensity Mean (638 nm)", "Diameter (Equivalent) (um)", "Eccentricity"
+        ]).to_parquet(os.path.join(d, "m.parquet"))
+
+        info = run(os.path.join(d, "m.parquet"), os.path.join(d, "report"))
+        assert info["timepoints"] == [0, 1, 2]
+        assert info["responders"] > 0
+        for f in ("index.html", "responder_fraction.png",
+                  "group_timepoint_summary.csv", "responder_characteristics.csv"):
+            assert os.path.exists(os.path.join(d, "report", f)), f
+        # The subpopulation must be detected as larger in H2 than H3 at the last timepoint.
+        s = pd.read_csv(os.path.join(d, "report", "group_timepoint_summary.csv"))
+        last = s[s["Timepoint"] == 2].set_index("group")["pct_responders"]
+        assert last["H2"] > last["H3"] + 10, last.to_dict()
+
+
+def test_qc_report():
+    try:
+        import pandas as pd
+        import pyarrow  # noqa: F401
+    except ImportError:
+        print("  (skipped qc test: pandas/pyarrow not installed)")
+        return
+    import os
+    import tempfile
+
+    from cellscope.qc import format_issues, qc_report
+
+    with tempfile.TemporaryDirectory() as d:
+        # A clean table: unique keys, no NaN/saturation, contiguous timepoints.
+        clean = pd.DataFrame({
+            "Dataset": ["ds"] * 6,
+            "Well": ["H2"] * 6,
+            "fov": ["0"] * 3 + ["1"] * 3,
+            "Timepoint": [0, 1, 2] * 2,
+            "Label": [1, 1, 1, 1, 1, 1],
+            "Intensity Mean (488 nm)": [100.0, 110.0, 120.0, 90.0, 95.0, 100.0],
+            "Intensity Max (488 nm)": [500.0, 510.0, 520.0, 490.0, 495.0, 500.0],
+        })
+        p_clean = os.path.join(d, "clean.parquet")
+        clean.to_parquet(p_clean)
+        rep = qc_report(p_clean, os.path.join(d, "qc_clean.json"))
+        assert rep["ok"], rep["issues"]
+        assert rep["duplicate_key_rows"] == 0
+        assert os.path.exists(os.path.join(d, "qc_clean.json"))
+        assert format_issues(rep) == "QC: no issues found."
+
+        # A corrupt table that mimics every silent failure mode at once:
+        #  * no 'fov' column -> (Well, Timepoint, Label) collides across FOVs,
+        #  * a NaN (missing/blank channel) intensity row,
+        #  * a saturated cell, and
+        #  * a gap in the timepoint sequence (0, 2 - missing 1).
+        bad = pd.DataFrame({
+            "Dataset": ["ds"] * 4,
+            "Well": ["H2", "H2", "H2", "H2"],
+            "Timepoint": [0, 0, 2, 2],
+            "Label": [1, 1, 2, 2],  # (Well, Timepoint, Label) duplicated -> collision
+            "Intensity Mean (488 nm)": [100.0, float("nan"), 120.0, 130.0],
+            "Intensity Max (488 nm)": [500.0, 510.0, 70000.0, 520.0],  # >saturation
+        })
+        p_bad = os.path.join(d, "bad.parquet")
+        bad.to_parquet(p_bad)
+        rep2 = qc_report(p_bad)
+        assert not rep2["ok"]
+        blob = " ".join(rep2["issues"]).lower()
+        assert "fov" in blob            # missing-fov key-collision warning
+        assert rep2["duplicate_key_rows"] > 0
+        assert "blank channel" in blob or "missing" in blob  # NaN intensity
+        assert "saturation" in blob     # saturated cell
+        assert "gap" in blob            # 0,2 timepoint gap
+        assert "QC:" in format_issues(rep2)
+
+
 def test_cephla_multi_timepoint_folders():
     import json
     import tempfile
@@ -361,6 +470,8 @@ if __name__ == "__main__":
     test_cephla_pixel_size_tube_lens_correction()
     test_cephla_flat_single_timepoint_folder()
     test_cephla_multi_timepoint_folders()
+    test_qc_report()
+    test_analyze_report()
     test_mock_small_size_ok()
     test_mock_rejects_tiny_size()
     print(f"All analysis checks passed in {time.time() - t0:.1f}s")

@@ -38,6 +38,7 @@ from cellscope.data import CephlaLoader, FolderLoader, MockLoader
 from cellscope.export import (
     combine_parquet,
     measurements_header,
+    split_region_fov,
     write_measurements_csv,
     write_measurements_parquet,
 )
@@ -69,7 +70,7 @@ _WORKER: dict = {}
 
 
 def _init_worker(folder, settings_kw, pixel_size, downsample, out_dir, resume,
-                 fmt, dataset, profile=False) -> None:
+                 fmt, dataset, profile=False, condition_map=None) -> None:
     _WORKER["loader"] = build_loader(folder)
     _WORKER["settings"] = AnalysisSettings(**settings_kw)
     _WORKER["pixel_size"] = pixel_size
@@ -79,6 +80,7 @@ def _init_worker(folder, settings_kw, pixel_size, downsample, out_dir, resume,
     _WORKER["format"] = fmt
     _WORKER["dataset"] = dataset
     _WORKER["profile"] = profile
+    _WORKER["condition_map"] = condition_map or {}
 
 
 def _analyze_one(well_id: str, array=None, load_secs: float = 0.0):
@@ -102,11 +104,13 @@ def _analyze_one(well_id: str, array=None, load_secs: float = 0.0):
             pixel_size_um=_WORKER["pixel_size"], downsample=_WORKER["downsample"],
             array=array,
         )
+        region, _fov = split_region_fov(well_id)
+        condition = _WORKER["condition_map"].get(region, "")
         if _WORKER["format"] == "parquet":
-            write_measurements_parquet(str(out), [(well_id, wa)],
+            write_measurements_parquet(str(out), [(well_id, condition, wa)],
                                        dataset=_WORKER["dataset"])
         else:
-            write_measurements_csv(str(out), [(well_id, "", wa)])
+            write_measurements_csv(str(out), [(well_id, condition, wa)])
         if _WORKER.get("profile") and "end" in stamps:
             seg = stamps.get("seg", stamps["end"]) - stamps["start"]
             quant = stamps["end"] - stamps.get("seg", stamps["end"])
@@ -138,6 +142,26 @@ def _combine(out_dir: Path, wells, channel_names) -> Path:
                 for line in src:
                     dst.write(line)
     return combined
+
+
+def _load_platemap(path) -> dict:
+    """Read a well->condition CSV (columns: well/region + condition/treatment)."""
+    if not path:
+        return {}
+    import csv as _csv
+    mapping: dict = {}
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = _csv.DictReader(f)
+            lower = {c.lower().strip(): c for c in (reader.fieldnames or [])}
+            wcol = lower.get("well") or lower.get("region")
+            ccol = lower.get("condition") or lower.get("treatment") or lower.get("group")
+            if wcol and ccol:
+                for row in reader:
+                    mapping[str(row[wcol]).strip()] = str(row[ccol]).strip()
+    except OSError:
+        pass
+    return mapping
 
 
 def main(argv=None) -> int:
@@ -172,6 +196,11 @@ def main(argv=None) -> int:
                          "background thread so disk I/O overlaps compute (0 = off)")
     ap.add_argument("--profile", action="store_true",
                     help="Print per-position load / segment / quantify seconds")
+    ap.add_argument("--analyze", action="store_true",
+                    help="After the run, auto-write a subpopulation analysis report "
+                         "(parquet only; needs pandas+matplotlib). Implies --combine.")
+    ap.add_argument("--platemap", default=None,
+                    help="CSV mapping Well->condition, used by --analyze")
     ap.add_argument("--sensitivity", type=float, default=0.5)
     ap.add_argument("--smoothing", type=float, default=1.5)
     ap.add_argument("--min-size", type=int, default=25)
@@ -188,6 +217,8 @@ def main(argv=None) -> int:
         level=logging.INFO, format="%(levelname)s %(name)s: %(message)s",
         stream=sys.stderr,
     )
+    if args.analyze:
+        args.combine = True  # the report reads the combined parquet
 
     loader = build_loader(args.folder)
     wells = _select([w.well_id for w in loader.list_wells()], args.positions)
@@ -250,8 +281,10 @@ def main(argv=None) -> int:
         engine=args.engine, cellpose_model=args.cellpose_model,
         cellpose_diameter=args.cellpose_diameter, cellpose_gpu=not args.no_gpu,
     )
+    condition_map = _load_platemap(args.platemap)
     initargs = (args.folder, settings_kw, args.pixel_size, args.downsample,
-                str(out_dir), args.resume, args.format, dataset, args.profile)
+                str(out_dir), args.resume, args.format, dataset, args.profile,
+                condition_map)
 
     device_note = f", {gpu_info['detail']}" if gpu_info else ""
     print(f"CellScope batch: {len(wells)} positions, engine={args.engine}{device_note}, "
@@ -333,6 +366,7 @@ def main(argv=None) -> int:
     )
     write_run_metadata(str(out_dir / RUN_METADATA_NAME), meta)
 
+    combined_path = None
     if args.combine:
         if args.format == "parquet":
             parts = [str(out_dir / f"{_safe_name(w)}.parquet") for w in wells]
@@ -342,6 +376,32 @@ def main(argv=None) -> int:
         else:
             combined = _combine(out_dir, wells, channel_names)
             print(f"Combined -> {combined}", flush=True)
+
+    # QC pass: the pipeline's worst failure is emitting plausible-looking wrong
+    # data silently, so a run flags its own corruption modes (non-unique per-cell
+    # keys, missing/blank channels, saturation, missing timepoints) before the
+    # numbers reach analysis. Never fails the run - it only reports.
+    if combined_path is not None and args.format == "parquet":
+        try:
+            from cellscope.qc import format_issues, qc_report
+            rep = qc_report(str(combined_path), str(out_dir / "qc.json"))
+            print(format_issues(rep), flush=True)
+        except Exception as exc:  # noqa: BLE001 - QC must never fail the run
+            print(f"QC check skipped: {exc}", file=sys.stderr)
+
+    if args.analyze and args.format == "parquet" and combined_path is not None:
+        try:
+            from cellscope.analyze import run as analyze_run
+            report_dir = out_dir / "report"
+            info = analyze_run(str(combined_path), str(report_dir), platemap=args.platemap)
+            print(f"Analysis report -> {report_dir / 'index.html'}  "
+                  f"({info['cells_gated']:,} cells, {len(info['groups'])} groups, "
+                  f"{len(info['timepoints'])} timepoints, {info['responders']:,} responders)",
+                  flush=True)
+        except Exception as exc:  # noqa: BLE001 - a report failure must not fail the run
+            print(f"Analysis report skipped: {exc}", file=sys.stderr)
+    elif args.analyze and args.format != "parquet":
+        print("--analyze needs --format parquet; skipping report.", file=sys.stderr)
 
     return 0 if not failed else 2
 
