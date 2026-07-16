@@ -25,7 +25,7 @@ in each panel title so the visible n is honest. ``--linear`` plots every cell.
 Usage:
     python fog_plot.py all_measurements.parquet -o out.png --facet-by Well
         [--channel "Intensity Mean (488 nm)"] [--platemap plate.csv]
-        [--control Fluorescein] [--dark] [--linear]
+        [--control "Untreated"] [--exclude-timepoint 4] [--dark] [--linear]
 """
 from __future__ import annotations
 import argparse
@@ -149,6 +149,9 @@ def main(argv=None) -> int:
                     help="CSV (columns well,condition) to add a condition column")
     ap.add_argument("--control", default="",
                     help="comma-separated facet value(s) to draw in dashed grey as controls")
+    ap.add_argument("--exclude-timepoint", default="",
+                    help="comma-separated timepoints to drop before plotting (e.g. a "
+                         "partially-acquired one flagged by the coverage warning)")
     ap.add_argument("--dark", action="store_true")
     ap.add_argument("--linear", action="store_true")
     args = ap.parse_args(argv)
@@ -156,6 +159,12 @@ def main(argv=None) -> int:
     df = pd.read_parquet(args.parquet)
     if args.platemap:
         df = _apply_platemap(df, args.platemap)
+    drop_tp = {int(t) for t in args.exclude_timepoint.split(",") if t.strip().lstrip("-").isdigit()}
+    if drop_tp and "Timepoint" in df.columns:
+        before = len(df)
+        df = df[~df["Timepoint"].astype(int).isin(drop_tp)]
+        print(f"excluded timepoint(s) {sorted(drop_tp)}: dropped {before - len(df):,} of "
+              f"{before:,} cells", file=sys.stderr)
 
     channel = _resolve_column(df, args.channel)
     if channel is None:

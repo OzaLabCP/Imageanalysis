@@ -119,8 +119,16 @@ upgraded later:
   (Otsu) threshold nudged by the Sensitivity slider, then connected-component
   labeling. *(Upgrade path: Cellpose / StarDist.)*
 - **Track** (`analysis/tracking.py`): nearest-neighbour centroid linking between
-  frames with a distance gate, giving each cell a stable ID and color.
-  *(Upgrade path: btrack with cell division.)*
+  frames with a distance gate (`--max-distance`), giving each cell a track ID.
+  **Tracking contract — read before `groupby("Label")`:** IDs are stable only
+  across *consecutive* frames and are **per-position, not global** (each position
+  restarts at 1, which is why the parquet needs `fov` to key uniquely). A cell
+  present at frame N ends there; because a missing timepoint is laid down as an
+  empty frame, a **gap restarts the label space** (frame N ends at ID K, frame
+  N+2 resumes at K+1 for an unrelated cell). Group tracks by
+  `(Well, fov, segment, Label)` — never `(Well, Label)` across a gap — where the
+  exported `segment` column marks each contiguous, gap-free run of timepoints.
+  *(Upgrade path: btrack with cell division and gap-closing.)*
 - **Quantify** (`analysis/quantify.py`): per cell, per frame: area (pixels and
   microns squared), size as **equivalent and Feret (max-caliper) diameter in
   microns**, centroid, and **mean / total intensity per channel**. Exported as a
@@ -168,13 +176,22 @@ still reads by name): `Label`, `Diameter (Equivalent) (um)`,
 `Perimeter (um)`, per-channel `Intensity Mean/Max/STD/Min (<channel>)`,
 `Eccentricity`, `Dataset`, `Timepoint` (0-based), and `Well` (region).
 
-Two columns are **appended**: **`fov`** and **`condition`**. CellScope segments
-each field of view separately, so `Label` restarts at 1 per FOV; without `fov` the
-per-cell key `(Well, Timepoint, Label)` silently *collides* across the FOVs pooled
-into a well (two different cells map to one key). The unique per-cell key is
-therefore **`(Dataset, Well, fov, Timepoint, Label)`**. `condition` carries the
-platemap group through so downstream code needn't re-join. `--combine` writes one
+Three columns are **appended**: **`fov`**, **`condition`**, and **`segment`**.
+CellScope segments each field of view separately, so `Label` restarts at 1 per
+FOV; without `fov` the per-cell key `(Well, Timepoint, Label)` silently *collides*
+across the FOVs pooled into a well (two different cells map to one key). The unique
+per-cell key is therefore **`(Dataset, Well, fov, Timepoint, Label)`**. `condition`
+carries the platemap group through so downstream code needn't re-join. `segment`
+marks each contiguous, gap-free run of timepoints in a position — group *tracks*
+by **`(Well, fov, segment, Label)`** so a track ID is never joined across a
+missing frame (see the tracking contract above). `--combine` writes one
 `all_measurements.parquet` across positions.
+
+> **Storage dtype / saturation.** Intensity columns are written as float64, but
+> the *values* inherit the source images' dtype. Squid/Cephla exports are often
+> float16, whose largest finite value is **65504** (not uint16's 65535), so a
+> naive `>= 65535` saturation test never fires. The QC pass flags cells at or
+> above **65504**, catching the cap for both dtypes.
 
 ### Built-in QC (`qc.json`)
 

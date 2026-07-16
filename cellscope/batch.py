@@ -349,10 +349,18 @@ def main(argv=None) -> int:
     skipped = sum(1 for r in results if r[2] == "skipped")
     failed = [r for r in results if r[2].startswith("error")]
     total_cells = sum(r[1] for r in results if r[1] > 0)
+    # A position that analyzed cleanly but found zero cells is either a real
+    # acquisition problem or a segmentation failure - either way it must be
+    # reported, not left as an empty file for a reader to notice.
+    empty = [r[0] for r in results if r[2] == "ok" and r[1] == 0]
     print(f"\nDone: {ok} analyzed, {skipped} skipped, {len(failed)} failed, "
-          f"{total_cells} cells total, in {time.time() - t0:.0f}s", flush=True)
+          f"{len(empty)} empty (0 cells), {total_cells} cells total, "
+          f"in {time.time() - t0:.0f}s", flush=True)
     for r in failed:
         print(f"  FAILED {r[0]}: {r[2]}", file=sys.stderr)
+    if empty:
+        shown = ", ".join(empty[:20]) + (" ..." if len(empty) > 20 else "")
+        print(f"  EMPTY (0 cells in every frame): {shown}", file=sys.stderr, flush=True)
 
     # Provenance sidecar: exactly how these results were produced. Comparing two
     # of these files proves whether two runs were analyzed identically.
@@ -362,7 +370,7 @@ def main(argv=None) -> int:
         channel_names=channel_names, gpu=gpu_info, positions=wells,
         output_format=args.format,
         created_utc=datetime.now(timezone.utc).isoformat(),
-        extra={"dataset": dataset},
+        extra={"dataset": dataset, "empty_positions": empty},
     )
     write_run_metadata(str(out_dir / RUN_METADATA_NAME), meta)
 

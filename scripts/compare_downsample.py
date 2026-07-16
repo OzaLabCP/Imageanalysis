@@ -11,10 +11,10 @@ Reads two or more CellScope `all_measurements.parquet` files (e.g. full-res vs
 
 Usage (Windows-friendly - positional paths + labels):
     python compare_downsample.py ^
-        "C:\\...\\7_ds1\\all_measurements.parquet" ^
-        "C:\\...\\7_ds2\\all_measurements.parquet" ^
-        "C:\\...\\7_ds4\\all_measurements.parquet" ^
-        --labels 1x 2x 4x --plots "C:\\...\\7_compare"
+        "path\\to\\full_res\\all_measurements.parquet" ^
+        "path\\to\\downsample_2x\\all_measurements.parquet" ^
+        "path\\to\\downsample_4x\\all_measurements.parquet" ^
+        --labels 1x 2x 4x --plots "path\\to\\compare_out"
 
 Requires pandas + scipy (already in the CellScope venv). --plots is optional
 (needs matplotlib) and writes one overlaid-histogram PNG per metric.

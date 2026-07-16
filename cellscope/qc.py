@@ -7,7 +7,10 @@ with no warning. This surfaces the silent modes so a run flags them itself:
     cells from different fields of view onto one Label),
   * rows with a missing / blank channel (NaN intensity),
   * cells at or above sensor saturation,
-  * positions missing timepoints, and gaps in the timepoint sequence.
+  * positions missing timepoints, and gaps in the timepoint sequence,
+  * a per-timepoint coverage matrix (positions reaching each timepoint), and a
+    flag when a timepoint is present in under half the positions - which makes a
+    partial acquisition read as a biological crash rather than absent data.
 
 Writes ``qc.json`` and returns the report; ``format_issues`` renders warnings.
 """
@@ -64,11 +67,26 @@ def qc_report(parquet: str, out_json: str | None = None) -> dict:
             issues.append(f"timepoint sequence has gaps: {tps}")
         grp = ["Well"] + (["fov"] if "fov" in df.columns else [])
         per_pos = df.groupby(grp)["Timepoint"].nunique()
-        rep["positions"] = int(len(per_pos))
+        n_pos = int(len(per_pos))
+        rep["positions"] = n_pos
+        # Coverage matrix: how many positions reached each timepoint. A timepoint
+        # present in only a fraction of positions (e.g. a partial download) makes
+        # any count-over-time look like a biological crash when it is just absent
+        # positions - so surface it as data, and flag the under-covered ones.
+        cover = {int(t): int(g.drop_duplicates(grp).shape[0])
+                 for t, g in df.groupby("Timepoint")}
+        rep["positions_per_timepoint"] = cover
         short = int((per_pos < len(tps)).sum())
         if short:
-            issues.append(f"{short} of {len(per_pos)} positions are missing timepoints "
+            issues.append(f"{short} of {n_pos} positions are missing timepoints "
                           f"(partial coverage vs {len(tps)} total)")
+        # A timepoint reached by well under half the positions is almost always an
+        # acquisition artifact masquerading as data.
+        under = {t: c for t, c in cover.items() if n_pos and c < 0.5 * n_pos}
+        if under:
+            worst = ", ".join(f"TP{t}: {c}/{n_pos}" for t, c in sorted(under.items()))
+            issues.append(f"timepoint(s) reached by <50% of positions ({worst}) - "
+                          f"a count-over-time will read as a crash, not biology")
 
     rep["ok"] = not issues
     if out_json:

@@ -196,7 +196,7 @@ def test_parquet_exact_schema():
         "Intensity Min (GFP)", "Intensity Min (Alexa Fluor 647)",
         "Eccentricity", "Dataset", "Timepoint", "Well",
     ]
-    expected = reference18 + ["fov", "condition"]
+    expected = reference18 + ["fov", "condition", "segment"]
     cols = parquet_columns(loader.channel_names)
     assert cols == expected, cols
     # The reference schema must remain the exact 18-column prefix.
@@ -212,6 +212,7 @@ def test_parquet_exact_schema():
         assert types["Label"] == "int64" and types["Timepoint"] == "int64"
         assert types["Dataset"] == "string" and types["Well"] == "string"
         assert types["fov"] == "string" and types["condition"] == "string"
+        assert types["segment"] == "int64"
         assert types["Eccentricity"] == "double"
         # Timepoint is 0-based (unlike the tidy CSV's 1-based `time`).
         assert min(t.column("Timepoint").to_pylist()) == 0
@@ -219,6 +220,8 @@ def test_parquet_exact_schema():
         assert set(t.column("Well").to_pylist()) == {wid}
         # condition is threaded through from the (well, condition, wa) item.
         assert set(t.column("condition").to_pylist()) == {"ctrl"}
+        # A gap-free time course is one segment (0).
+        assert set(t.column("segment").to_pylist()) == {0}
 
 
 def test_provenance_and_device():
@@ -352,6 +355,24 @@ def test_analyze_report():
         assert last["H2"] > last["H3"] + 10, last.to_dict()
 
 
+def test_segment_map_marks_gaps():
+    from types import SimpleNamespace
+
+    from cellscope.export import segment_map
+
+    def wa(frames):
+        return SimpleNamespace(measurements=[SimpleNamespace(frame=f) for f in frames])
+
+    # A gap-free run is one segment.
+    assert segment_map(wa([0, 0, 1, 2, 2])) == {0: 0, 1: 0, 2: 0}
+    # A missing timepoint (3, then 5) starts a new segment - so grouping by
+    # (position, segment, Label) can't join a track across the gap.
+    m = segment_map(wa([0, 1, 3, 5, 6]))
+    assert m == {0: 0, 1: 0, 3: 1, 5: 2, 6: 2}, m
+    # Two cells the tracker split across a gap land in different segments.
+    assert m[3] != m[5]
+
+
 def test_qc_report():
     try:
         import pandas as pd
@@ -407,6 +428,22 @@ def test_qc_report():
         assert "saturation" in blob     # saturated cell
         assert "gap" in blob            # 0,2 timepoint gap
         assert "QC:" in format_issues(rep2)
+
+        # Coverage matrix: 3 positions all reach TP0; only 1 reaches TP2 -> the
+        # under-covered timepoint must be reported as data and flagged.
+        cov = pd.DataFrame({
+            "Well": ["H2", "H2", "H3", "H2"],
+            "fov": ["0", "1", "0", "0"],
+            "Timepoint": [0, 0, 0, 2],
+            "Label": [1, 1, 1, 1],
+            "Intensity Mean (488 nm)": [100.0, 100.0, 100.0, 100.0],
+        })
+        p_cov = os.path.join(d, "cov.parquet")
+        cov.to_parquet(p_cov)
+        repc = qc_report(p_cov)
+        assert repc["positions"] == 3
+        assert repc["positions_per_timepoint"] == {0: 3, 2: 1}, repc["positions_per_timepoint"]
+        assert any("<50%" in m for m in repc["issues"]), repc["issues"]
 
 
 def test_fog_plot_script():
@@ -529,6 +566,7 @@ if __name__ == "__main__":
     test_cephla_pixel_size_tube_lens_correction()
     test_cephla_flat_single_timepoint_folder()
     test_cephla_multi_timepoint_folders()
+    test_segment_map_marks_gaps()
     test_qc_report()
     test_fog_plot_script()
     test_analyze_report()

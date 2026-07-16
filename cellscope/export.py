@@ -32,9 +32,31 @@ def split_region_fov(well_id: str) -> tuple[str, str]:
     return well_id, ""
 
 
+def segment_map(wa) -> "dict[int, int]":
+    """Map each timepoint present in a position to a contiguous-run index.
+
+    Tracking links only *consecutive* frames, and the loader lays positions on a
+    global time axis, so a missing timepoint leaves an empty frame that breaks
+    every track across it: the label space restarts (frame N ends at track K,
+    frame N+2 resumes at K+1 for unrelated cells). A downstream
+    ``groupby("Label")`` over such a position would silently join two different
+    cells. This assigns a ``segment`` that increments at each gap, so grouping by
+    ``(Well, fov, segment, Label)`` is gap-safe and a track spanning two segments
+    is visibly a gap-crossing artifact rather than one cell.
+    """
+    frames = sorted({int(m.frame) for m in wa.measurements})
+    seg: dict[int, int] = {}
+    s = 0
+    for i, f in enumerate(frames):
+        if i and f - frames[i - 1] > 1:
+            s += 1
+        seg[f] = s
+    return seg
+
+
 def measurements_header(channel_names) -> list[str]:
     return (
-        ["well", "region", "fov", "condition", "cell_id", "time",
+        ["well", "region", "fov", "condition", "segment", "cell_id", "time",
          "centroid_x", "centroid_y", "area_px", "area_um2",
          "equiv_diameter_um", "feret_diameter_um"]
         + [f"mean_{n}" for n in channel_names]
@@ -44,9 +66,10 @@ def measurements_header(channel_names) -> list[str]:
 
 def measurement_rows(well_id: str, condition: str, wa):
     region, fov = split_region_fov(well_id)
+    seg = segment_map(wa)
     for m in wa.measurements:
         yield (
-            [well_id, region, fov, condition, m.track_id, m.frame + 1,
+            [well_id, region, fov, condition, seg[int(m.frame)], m.track_id, m.frame + 1,
              round(m.centroid_x, 2), round(m.centroid_y, 2),
              m.area_px, round(m.area_um2, 3),
              round(m.equiv_diameter_um, 3), round(m.feret_diameter_um, 3)]
@@ -97,12 +120,16 @@ _PARQUET_MORPHO = [
 
 
 # The first 18 columns are the fixed "regionprops-style" reference layout (so a
-# notebook built on that schema still reads by name). ``fov`` and ``condition``
-# are appended because CellScope segments each field of view separately, so
-# ``Label`` restarts at 1 per FOV - without ``fov`` the per-cell key
-# (Well, Timepoint, Label) collides across the FOVs pooled into a well. ``Well``
-# holds the region; the unique per-cell key is (Dataset, Well, fov, Timepoint, Label).
-_PARQUET_KEY_TAIL = ["Eccentricity", "Dataset", "Timepoint", "Well", "fov", "condition"]
+# notebook built on that schema still reads by name). ``fov``, ``condition`` and
+# ``segment`` are appended because CellScope segments each field of view
+# separately, so ``Label`` restarts at 1 per FOV - without ``fov`` the per-cell
+# key (Well, Timepoint, Label) collides across the FOVs pooled into a well.
+# ``Well`` holds the region; the unique per-cell key is
+# (Dataset, Well, fov, Timepoint, Label). ``segment`` marks contiguous
+# timepoint runs so track IDs are only joined within a gap-free run: group tracks
+# by (Well, fov, segment, Label), never (Well, Label) across a missing frame.
+_PARQUET_KEY_TAIL = ["Eccentricity", "Dataset", "Timepoint", "Well", "fov",
+                     "condition", "segment"]
 
 
 def parquet_columns(channel_names) -> list[str]:
@@ -124,6 +151,7 @@ def _parquet_column_data(items, channel_names, dataset: str) -> "dict[str, list]
     n_chan = len(channel_names)
     for well_id, condition, wa in items:
         region, fov = split_region_fov(well_id)
+        seg = segment_map(wa)
         for m in wa.measurements:
             cols["Label"].append(int(m.track_id))
             for name, attr in _PARQUET_MORPHO:
@@ -139,6 +167,7 @@ def _parquet_column_data(items, channel_names, dataset: str) -> "dict[str, list]
             cols["Well"].append(region)
             cols["fov"].append(fov)
             cols["condition"].append(condition or "")
+            cols["segment"].append(seg[int(m.frame)])
     return cols
 
 
@@ -156,7 +185,7 @@ def write_measurements_parquet(path: str, items, dataset: str = "") -> int:
     channel_names = items[0][2].channel_names
     data = _parquet_column_data(items, channel_names, dataset)
 
-    int_cols = {"Label", "Timepoint"}
+    int_cols = {"Label", "Timepoint", "segment"}
     str_cols = {"Dataset", "Well", "fov", "condition"}
     arrays, names = [], []
     for name in parquet_columns(channel_names):
