@@ -250,6 +250,42 @@ def test_cephla_pixel_size_tube_lens_correction():
     assert _pixel_size_from_params({}) == 1.0
 
 
+def test_cephla_flat_single_timepoint_folder():
+    import json
+    import tempfile
+
+    import tifffile
+    from cellscope.data.cephla_loader import CephlaLoader
+
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d)
+        # A flat, single-timepoint Cephla export: images + metadata together,
+        # no numbered timepoint subfolders (the layout a single download yields).
+        params = {"sensor_pixel_size_um": 1.85, "tube_lens_mm": 50,
+                  "objective": {"magnification": 20.0, "tube_lens_f_mm": 180.0}}
+        (p / "acquisition parameters.json").write_text(json.dumps(params))
+        img = np.full((80, 80), 120, dtype=np.uint16)
+        img[30:50, 30:50] = 4000
+        for region in ("H2", "H3"):
+            for fov in (0, 1):
+                for chan in ("Fluorescence_488_nm_Ex", "Fluorescence_638_nm_Ex"):
+                    tifffile.imwrite(str(p / f"{region}_{fov}_0_{chan}.tiff"), img)
+
+        assert CephlaLoader.looks_like(p) is True
+        ld = CephlaLoader(str(p))
+        assert ld.channel_names == ["488 nm", "638 nm"], ld.channel_names
+        assert abs(ld.pixel_size_um - 0.333) < 0.002, ld.pixel_size_um  # tube-lens corrected
+        assert sorted(w.well_id for w in ld.list_wells()) == ["H2-0", "H2-1", "H3-0", "H3-1"]
+        assert ld.get_well("H2-0").shape == (1, 1, 2, 80, 80)  # (T, Z, C, Y, X)
+
+    # A folder that is NOT Cephla-named must not be hijacked.
+    with tempfile.TemporaryDirectory() as d2:
+        p2 = Path(d2)
+        for name in ("photo.tif", "scan_a.tif", "img001.tif"):
+            tifffile.imwrite(str(p2 / name), np.zeros((8, 8), dtype=np.uint16))
+        assert CephlaLoader.looks_like(p2) is False
+
+
 def test_mock_small_size_ok():
     loader = MockLoader(size=64, n_wells=2, n_time=3)
     arr = loader.get_well(loader.list_wells()[0].well_id)
@@ -278,6 +314,7 @@ if __name__ == "__main__":
     test_parquet_exact_schema()
     test_provenance_and_device()
     test_cephla_pixel_size_tube_lens_correction()
+    test_cephla_flat_single_timepoint_folder()
     test_mock_small_size_ok()
     test_mock_rejects_tiny_size()
     print(f"All analysis checks passed in {time.time() - t0:.1f}s")

@@ -68,6 +68,12 @@ def _channel_label(chan_key: str) -> str:
     return chan_key.replace("_", " ").strip()
 
 
+def _is_cephla_name(stem: str) -> bool:
+    """True for a '<region>_<fov>_<z>_<channel>' Cephla/Squid image stem."""
+    parts = stem.split("_", 3)
+    return len(parts) >= 4 and parts[1].isdigit() and parts[2].isdigit()
+
+
 def _pixel_size_from_params(params: dict) -> float:
     """Microns per pixel from a Squid/Cephla ``acquisition parameters.json``.
 
@@ -118,11 +124,20 @@ class CephlaLoader(DatasetLoader):
         folder = Path(folder)
         if (folder / "acquisition parameters.json").exists():
             return True
-        if (folder / "coordinates.csv").exists() and any(
-            d.is_dir() and d.name.isdigit() for d in folder.iterdir()
-        ):
+        try:
+            entries = list(folder.iterdir())
+        except (OSError, ValueError):
+            return False
+        has_numbered = any(d.is_dir() and d.name.isdigit() for d in entries)
+        if (folder / "coordinates.csv").exists() and has_numbered:
             return True
-        return False
+        # A flat folder of Cephla-named images (region_fov_z_channel) with no
+        # numbered timepoint subfolders - e.g. a single downloaded timepoint.
+        # Require several matching files so ordinary folders aren't hijacked.
+        tiffs = [p for p in entries
+                 if p.is_file() and p.suffix.lower() in (".tif", ".tiff")]
+        cephla = sum(1 for p in tiffs if _is_cephla_name(p.stem))
+        return cephla >= 3 and cephla * 2 >= len(tiffs)
 
     def __init__(self, folder: str) -> None:
         self._folder = Path(folder)
@@ -131,13 +146,22 @@ class CephlaLoader(DatasetLoader):
         self._cache: "OrderedDict[str, np.ndarray]" = OrderedDict()
         self._cache_limit = 2  # positions are large; keep only a couple resident
 
-        # Timepoint folders, numerically ordered.
+        # Timepoint folders, numerically ordered. If there are none, treat this
+        # folder itself as a single timepoint when it holds Cephla-named images
+        # directly (a flat, single-timepoint export).
         self._timepoints = sorted(
             (d for d in self._folder.iterdir() if d.is_dir() and d.name.isdigit()),
             key=lambda d: int(d.name),
         )
         if not self._timepoints:
-            raise ValueError("No numbered timepoint folders found")
+            has_flat_images = any(
+                _is_cephla_name(p.stem) for p in self._folder.iterdir()
+                if p.is_file() and p.suffix.lower() in (".tif", ".tiff")
+            )
+            if has_flat_images:
+                self._timepoints = [self._folder]
+            else:
+                raise ValueError("No numbered timepoint folders or Cephla images found")
 
         params = self._read_params()
         self._pixel = self._compute_pixel_size(params)
@@ -178,11 +202,16 @@ class CephlaLoader(DatasetLoader):
 
     # --- metadata ---------------------------------------------------------
     def _read_params(self) -> dict:
-        path = self._folder / "acquisition parameters.json"
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
+        # The metadata usually sits with the images, but can be a level or two up
+        # (e.g. at the acquisition root above the timepoint folders).
+        for base in (self._folder, self._folder.parent, self._folder.parent.parent):
+            path = base / "acquisition parameters.json"
+            if path.exists():
+                try:
+                    return json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+        return {}
 
     def _compute_pixel_size(self, params: dict) -> float:
         return _pixel_size_from_params(params)

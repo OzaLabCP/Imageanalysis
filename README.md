@@ -99,8 +99,12 @@ CellScope figures out the structure automatically, no setup:
   `<region>_<fov>_<z>_<channel>.tiff` files and an `acquisition parameters.json`)
   is auto-detected: each **(well, field of view)** becomes one position, channels
   and colors come from the acquisition, and the **pixel size is read from the
-  metadata** (sensor size / magnification) so measurements are already in
-  microns without ruler calibration.
+  metadata** so measurements are already in microns without ruler calibration.
+  A **single flat folder** of those `<region>_<fov>_<z>_<channel>.tiff` images
+  (e.g. one downloaded timepoint, with the metadata alongside or a level up) is
+  recognized too. The pixel size honors the **tube-lens correction** — an
+  objective's magnification is specified for its design tube lens, so a 20x used
+  on a 50 mm tube lens instead of its 180 mm design images at 20·50/180 = 5.56x.
 
 Color (RGB) images become three channels (Red/Green/Blue) unless a channel token
 says otherwise. If a folder has no images, CellScope tells you and keeps your
