@@ -300,6 +300,36 @@ def test_cephla_flat_single_timepoint_folder():
         assert CephlaLoader.looks_like(p2) is False
 
 
+def test_cephla_multi_timepoint_folders():
+    import json
+    import tempfile
+
+    import tifffile
+    from cellscope.data.cephla_loader import CephlaLoader
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        params = {"sensor_pixel_size_um": 1.85, "tube_lens_mm": 50,
+                  "objective": {"magnification": 20.0, "tube_lens_f_mm": 180.0}}
+        img = np.full((72, 72), 120, dtype=np.uint16)
+        img[24:44, 24:44] = 4000
+        # Numbered timepoint folders, each with images + metadata inside (not at root).
+        for tp in ("0", "1", "7"):
+            sub = root / tp
+            sub.mkdir()
+            (sub / "acquisition parameters.json").write_text(json.dumps(params))
+            for region in ("H2", "H3"):
+                for chan in ("Fluorescence_488_nm_Ex", "Fluorescence_638_nm_Ex"):
+                    tifffile.imwrite(str(sub / f"{region}_0_0_{chan}.tiff"), img)
+
+        assert CephlaLoader.looks_like(root) is True
+        ld = CephlaLoader(str(root))
+        assert ld.channel_names == ["488 nm", "638 nm"]
+        assert abs(ld.pixel_size_um - 0.333) < 0.002  # metadata found inside a timepoint folder
+        # Three timepoint folders -> a 3-frame time axis.
+        assert ld.get_well("H2-0").shape[0] == 3
+
+
 def test_mock_small_size_ok():
     loader = MockLoader(size=64, n_wells=2, n_time=3)
     arr = loader.get_well(loader.list_wells()[0].well_id)
@@ -330,6 +360,7 @@ if __name__ == "__main__":
     test_run_analysis_accepts_prefetched_array()
     test_cephla_pixel_size_tube_lens_correction()
     test_cephla_flat_single_timepoint_folder()
+    test_cephla_multi_timepoint_folders()
     test_mock_small_size_ok()
     test_mock_rejects_tiny_size()
     print(f"All analysis checks passed in {time.time() - t0:.1f}s")

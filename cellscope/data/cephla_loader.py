@@ -131,6 +131,17 @@ class CephlaLoader(DatasetLoader):
         has_numbered = any(d.is_dir() and d.name.isdigit() for d in entries)
         if (folder / "coordinates.csv").exists() and has_numbered:
             return True
+        # Numbered timepoint subfolders that themselves hold Cephla-named images -
+        # some acquisitions store the metadata inside each timepoint folder rather
+        # than at the acquisition root, so the root has no json/csv to key off.
+        for d in entries:
+            if d.is_dir() and d.name.isdigit():
+                try:
+                    if any(_is_cephla_name(p.stem) for p in d.iterdir()
+                           if p.is_file() and p.suffix.lower() in (".tif", ".tiff")):
+                        return True
+                except OSError:
+                    continue
         # A flat folder of Cephla-named images (region_fov_z_channel) with no
         # numbered timepoint subfolders - e.g. a single downloaded timepoint.
         # Require several matching files so ordinary folders aren't hijacked.
@@ -202,9 +213,12 @@ class CephlaLoader(DatasetLoader):
 
     # --- metadata ---------------------------------------------------------
     def _read_params(self) -> dict:
-        # The metadata usually sits with the images, but can be a level or two up
-        # (e.g. at the acquisition root above the timepoint folders).
-        for base in (self._folder, self._folder.parent, self._folder.parent.parent):
+        # The metadata may sit with the images (inside a timepoint folder), at the
+        # acquisition root, or a level or two up. Search the timepoint folders
+        # first, then upward.
+        bases = list(self._timepoints or [])
+        bases += [self._folder, self._folder.parent, self._folder.parent.parent]
+        for base in bases:
             path = base / "acquisition parameters.json"
             if path.exists():
                 try:
