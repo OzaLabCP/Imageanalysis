@@ -68,6 +68,44 @@ def _channel_label(chan_key: str) -> str:
     return chan_key.replace("_", " ").strip()
 
 
+def _pixel_size_from_params(params: dict) -> float:
+    """Microns per pixel from a Squid/Cephla ``acquisition parameters.json``.
+
+    Precedence:
+      1. an explicit ``pixel_size_um`` (e.g. written by cellscope-downsample so a
+         reduced-resolution copy reports its true effective pixel size);
+      2. ``sensor_pixel_size_um`` / *effective* magnification. The objective's
+         magnification is specified for its design tube-lens focal length
+         (``tube_lens_f_mm``); when the system uses a different tube lens
+         (``tube_lens_mm``), the effective magnification - and therefore the
+         pixel size - scales by that ratio. A nominal 20x objective on a 50 mm
+         tube lens instead of its 180 mm design images at 20*50/180 = 5.56x, so
+         the true pixel size is ~3.6x larger than the naive sensor/magnification;
+      3. 1.0 as a last resort.
+    """
+    explicit = params.get("pixel_size_um")
+    try:
+        if explicit and float(explicit) > 0:
+            return float(explicit)
+    except (TypeError, ValueError):
+        pass
+    sensor = params.get("sensor_pixel_size_um")
+    obj = params.get("objective") if isinstance(params.get("objective"), dict) else {}
+    mag = obj.get("magnification") or params.get("magnification")
+    try:
+        if sensor and mag:
+            eff_mag = float(mag)
+            tube_used = params.get("tube_lens_mm")
+            tube_design = obj.get("tube_lens_f_mm")
+            if tube_used and tube_design and float(tube_design) > 0:
+                eff_mag = float(mag) * float(tube_used) / float(tube_design)
+            if eff_mag > 0:
+                return float(sensor) / eff_mag
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    return 1.0
+
+
 @dataclass
 class _Position:
     region: str
@@ -147,25 +185,7 @@ class CephlaLoader(DatasetLoader):
             return {}
 
     def _compute_pixel_size(self, params: dict) -> float:
-        # An explicit pixel_size_um wins (e.g. written by cellscope-downsample so
-        # a reduced-resolution copy reports its true effective pixel size).
-        explicit = params.get("pixel_size_um")
-        try:
-            if explicit and float(explicit) > 0:
-                return float(explicit)
-        except (TypeError, ValueError):
-            pass
-        sensor = params.get("sensor_pixel_size_um")
-        obj = params.get("objective") or {}
-        mag = obj.get("magnification") if isinstance(obj, dict) else None
-        if not mag:
-            mag = params.get("magnification")
-        try:
-            if sensor and mag:
-                return float(sensor) / float(mag)
-        except (TypeError, ValueError):
-            pass
-        return 1.0
+        return _pixel_size_from_params(params)
 
     def _scan(self, tp_folder: Path):
         regions: list[str] = []

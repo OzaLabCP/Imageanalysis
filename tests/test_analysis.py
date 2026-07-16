@@ -234,6 +234,22 @@ def test_provenance_and_device():
     assert meta["engine"] == "cellpose" and meta["n_positions"] == 1
 
 
+def test_cephla_pixel_size_tube_lens_correction():
+    from cellscope.data.cephla_loader import _pixel_size_from_params
+    # Real Squid params: 20x nominal, but a 50 mm tube lens vs its 180 mm design
+    # => effective 5.56x => 1.85 / 5.56 = 0.333 um/px (matches acquisition.yaml).
+    params = {"sensor_pixel_size_um": 1.85, "tube_lens_mm": 50,
+              "objective": {"magnification": 20.0, "tube_lens_f_mm": 180.0}}
+    assert abs(_pixel_size_from_params(params) - 0.333) < 0.002
+    # No tube-lens info -> naive sensor / magnification.
+    assert abs(_pixel_size_from_params(
+        {"sensor_pixel_size_um": 1.85, "objective": {"magnification": 20.0}}) - 0.0925) < 1e-3
+    # Explicit pixel size always wins; missing data -> 1.0.
+    assert _pixel_size_from_params(
+        {"pixel_size_um": 0.5, "sensor_pixel_size_um": 1.85}) == 0.5
+    assert _pixel_size_from_params({}) == 1.0
+
+
 def test_mock_small_size_ok():
     loader = MockLoader(size=64, n_wells=2, n_time=3)
     arr = loader.get_well(loader.list_wells()[0].well_id)
@@ -261,6 +277,7 @@ if __name__ == "__main__":
     test_extended_metrics_present_and_sane()
     test_parquet_exact_schema()
     test_provenance_and_device()
+    test_cephla_pixel_size_tube_lens_correction()
     test_mock_small_size_ok()
     test_mock_rejects_tiny_size()
     print(f"All analysis checks passed in {time.time() - t0:.1f}s")
