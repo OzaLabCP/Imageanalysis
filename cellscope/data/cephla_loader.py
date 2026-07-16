@@ -21,6 +21,7 @@ with no ruler calibration needed.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
 from collections import OrderedDict
@@ -30,6 +31,8 @@ from pathlib import Path
 import numpy as np
 
 from cellscope.data.loader import DatasetLoader, WellInfo
+
+logger = logging.getLogger(__name__)
 
 _WAVELENGTH_COLORS = [
     (405, (150, 130, 255)),
@@ -120,11 +123,17 @@ class CephlaLoader(DatasetLoader):
         self._positions: dict[str, _Position] = {}
         self._wells: list[WellInfo] = []
         for r_idx, region in enumerate(regions):
-            for fov in fovs_by_region[region]:
+            for fov_idx, fov in enumerate(fovs_by_region[region]):
                 well_id = f"{region}-{fov}"
                 self._positions[well_id] = _Position(region, fov)
+                # FOV tokens are usually numeric, but non-numeric ones must not
+                # crash the whole load - fall back to the enumeration index.
+                try:
+                    col = int(fov)
+                except (TypeError, ValueError):
+                    col = fov_idx
                 self._wells.append(WellInfo(
-                    well_id=well_id, row=r_idx, col=int(fov),
+                    well_id=well_id, row=r_idx, col=col,
                     n_time=len(self._timepoints), n_z=len(z_values),
                     n_channels=len(channels), height=self._height, width=self._width,
                 ))
@@ -278,10 +287,12 @@ class CephlaLoader(DatasetLoader):
                 for ci, chan in enumerate(self._channel_keys):
                     path = tp / f"{pos.region}_{pos.fov}_{z}_{chan}.tiff"
                     if not path.exists():
+                        logger.debug("missing plane, left blank: %s", path)
                         continue
                     try:
                         plane = tifffile.imread(str(path))
-                    except Exception:
+                    except Exception as exc:
+                        logger.warning("unreadable plane, left blank: %s (%s)", path, exc)
                         continue
                     if plane.ndim == 3:
                         plane = plane[..., 0]

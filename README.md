@@ -144,7 +144,23 @@ python -m cellscope.batch "/data/exp" -o out -j 8        # module form
 Options: `-j/--jobs` (workers), `--positions "B2-*,B3-0"` (glob subset),
 `--downsample N` (fast lower-res pass; measurements stay in microns),
 `--pixel-size`, `--sensitivity`/`--min-size`/`--seg-channel`/`--max-distance`,
-`--resume` (skip finished positions), `--combine`, `--list`.
+`--resume` (skip finished positions), `--combine`, `--list`,
+`--format csv|parquet`, `--dataset <name>`.
+
+Every run also writes a **`run_metadata.json`** provenance sidecar into the output
+folder recording exactly how the results were produced (engine, settings, pixel
+size, resolved GPU device, CellScope version, positions). Comparing two of these
+proves whether two runs were analyzed identically.
+
+### Parquet output (`--format parquet`)
+
+For pipelines built around a fixed "regionprops-style" table, `--format parquet`
+(needs `pip install "cellscope[parquet]"`) writes one row per cell per timepoint
+with a fixed 18-column schema: `Label`, `Diameter (Equivalent) (um)`,
+`Diameter (Feret) (um)`, `Length Major (um)`, `Length Minor (um)`,
+`Perimeter (um)`, per-channel `Intensity Mean/Max/STD/Min (<channel>)`,
+`Eccentricity`, `Dataset`, `Timepoint` (0-based), and `Well` (region, FOV pooled).
+`--combine` writes one `all_measurements.parquet` across positions.
 
 The output CSV includes a **`region`** column (well without the field-of-view
 suffix) so you can pool per well directly in pandas/seaborn. Analyzing positions
@@ -180,9 +196,14 @@ pip install "cellscope[cellpose]"
 cellscope-batch "/data/exp" -o results --engine cellpose --combine
 cellscope-batch "/data/exp" --engine cellpose --cellpose-diameter 40   # if you know the cell size
 ```
-With `--engine cellpose` the runner defaults to **one worker** (the GPU parallelizes
-internally by batching a position's frames); the `threshold` engine scales across
-CPU cores instead. Measurements come out identically in real microns either way.
+With `--engine cellpose` the runner uses **one worker** (the GPU parallelizes
+internally by batching a position's frames; multiple workers would load a model
+per process and exhaust GPU memory); the `threshold` engine scales across CPU
+cores instead. Measurements come out identically in real microns either way.
+
+The batch header now prints the **resolved compute device** (e.g. `CUDA GPU:
+NVIDIA RTX ...`), and warns loudly if a GPU was requested but isn't visible to
+PyTorch — Cellpose otherwise falls back to CPU silently, which is much slower.
 
 **In the app:** the Detect sheet's *Advanced options* shows a **Segmentation engine**
 choice (Threshold / Cellpose) whenever Cellpose is installed.

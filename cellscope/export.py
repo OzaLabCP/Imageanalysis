@@ -1,8 +1,17 @@
-"""GUI-free CSV export of per-cell measurements.
+"""GUI-free export of per-cell measurements.
 
 Shared by the desktop Results tab and the headless batch runner, so both write
 exactly the same tidy long-format table (one row per cell per timepoint). Has no
 Qt dependency, so it is safe to import in headless / cluster contexts.
+
+Two output shapes are offered:
+
+* ``write_measurements_csv`` - CellScope's native tidy CSV (well/region/fov,
+  condition, per-channel mean+total intensity, ...), 1-based ``time``.
+* ``write_measurements_parquet`` - a fixed "regionprops-style" parquet schema
+  (``Label``, diameters, axis lengths, perimeter, per-channel
+  Mean/Max/STD/Min intensity, ``Eccentricity``, ``Dataset``, 0-based
+  ``Timepoint``, ``Well``) for pipelines built around that column layout.
 """
 
 from __future__ import annotations
@@ -65,3 +74,116 @@ def write_measurements_csv(path: str, items) -> int:
                 writer.writerow(row)
                 n += 1
     return n
+
+
+# --- fixed "regionprops-style" parquet schema ---------------------------------
+# One row per cell per timepoint. Column names, order, and dtypes are fixed so
+# downstream analysis built around this layout reads CellScope output unchanged.
+# The per-channel intensity block is grouped by statistic, then channel:
+#   Intensity Mean (<ch0>), Intensity Mean (<ch1>), Intensity Max (<ch0>), ...
+_PARQUET_STATS = (
+    ("Mean", "mean_intensity"),
+    ("Max", "max_intensity"),
+    ("STD", "std_intensity"),
+    ("Min", "min_intensity"),
+)
+_PARQUET_MORPHO = [
+    ("Diameter (Equivalent) (um)", "equiv_diameter_um"),
+    ("Diameter (Feret) (um)", "feret_diameter_um"),
+    ("Length Major (um)", "length_major_um"),
+    ("Length Minor (um)", "length_minor_um"),
+    ("Perimeter (um)", "perimeter_um"),
+]
+
+
+def parquet_columns(channel_names) -> list[str]:
+    """Ordered column names of the parquet schema for a given channel set."""
+    cols = ["Label"] + [name for name, _ in _PARQUET_MORPHO]
+    for stat, _attr in _PARQUET_STATS:
+        cols += [f"Intensity {stat} ({n})" for n in channel_names]
+    cols += ["Eccentricity", "Dataset", "Timepoint", "Well"]
+    return cols
+
+
+def _parquet_column_data(items, channel_names, dataset: str) -> "dict[str, list]":
+    """Build column-oriented data for the parquet schema from analyzed wells."""
+    cols: dict[str, list] = {c: [] for c in parquet_columns(channel_names)}
+    n_chan = len(channel_names)
+    for well_id, wa in items:
+        region, _fov = split_region_fov(well_id)
+        for m in wa.measurements:
+            cols["Label"].append(int(m.track_id))
+            for name, attr in _PARQUET_MORPHO:
+                cols[name].append(float(getattr(m, attr)))
+            for stat, attr in _PARQUET_STATS:
+                values = getattr(m, attr)
+                for ci in range(n_chan):
+                    v = float(values[ci]) if ci < len(values) else 0.0
+                    cols[f"Intensity {stat} ({channel_names[ci]})"].append(v)
+            cols["Eccentricity"].append(float(m.eccentricity))
+            cols["Dataset"].append(dataset)
+            cols["Timepoint"].append(int(m.frame))  # 0-based, matches the schema
+            cols["Well"].append(region)
+    return cols
+
+
+def write_measurements_parquet(path: str, items, dataset: str = "") -> int:
+    """Write the fixed-schema parquet for one or more analyzed wells.
+
+    ``items`` is a list of ``(well_id, WellAnalysis)`` sharing a channel set.
+    ``dataset`` fills the ``Dataset`` column (e.g. the acquisition folder).
+    Returns the number of measurement rows written. Requires ``pyarrow``.
+    """
+    pa, pq = _require_pyarrow()
+    items = [(w, wa) for (w, wa) in items if wa is not None]
+    if not items:
+        return 0
+    channel_names = items[0][1].channel_names
+    data = _parquet_column_data(items, channel_names, dataset)
+
+    int_cols = {"Label", "Timepoint"}
+    str_cols = {"Dataset", "Well"}
+    arrays, names = [], []
+    for name in parquet_columns(channel_names):
+        values = data[name]
+        if name in int_cols:
+            arrays.append(pa.array(values, type=pa.int64()))
+        elif name in str_cols:
+            arrays.append(pa.array(values, type=pa.string()))
+        else:
+            arrays.append(pa.array(values, type=pa.float64()))
+        names.append(name)
+    table = pa.Table.from_arrays(arrays, names=names)
+    pq.write_table(table, path)
+    return table.num_rows
+
+
+def combine_parquet(out_path: str, part_paths) -> int:
+    """Concatenate per-position parquet files into one. Returns total rows."""
+    pa, pq = _require_pyarrow()
+    tables = [pq.read_table(p) for p in part_paths if _exists_nonempty(p)]
+    if not tables:
+        return 0
+    combined = pa.concat_tables(tables, promote_options="default")
+    pq.write_table(combined, out_path)
+    return combined.num_rows
+
+
+def _exists_nonempty(path) -> bool:
+    import os
+    try:
+        return os.path.exists(path) and os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
+def _require_pyarrow():
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError as exc:  # pragma: no cover - exercised via message only
+        raise RuntimeError(
+            "Parquet output needs pyarrow. Install it with:\n"
+            "    pip install pyarrow      (or: pip install 'cellscope[parquet]')"
+        ) from exc
+    return pa, pq

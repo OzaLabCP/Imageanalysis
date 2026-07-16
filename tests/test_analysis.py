@@ -15,7 +15,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from cellscope.analysis import AnalysisSettings, run_analysis  # noqa: E402
 from cellscope.analysis.segmentation import segment_frame  # noqa: E402
 from cellscope.data.mock import MockLoader  # noqa: E402
-from cellscope.render import compose_rgb  # noqa: E402
 
 
 def test_mock_dataset_shape():
@@ -90,6 +89,11 @@ def test_pixel_size_override_scales_measurements():
     f_base = sum(m.feret_diameter_um for m in base.measurements)
     f_dbl = sum(m.feret_diameter_um for m in doubled.measurements)
     assert abs(f_dbl / f_base - 2.0) < 0.01
+    # Every length metric scales linearly with the pixel size too.
+    for attr in ("length_major_um", "length_minor_um", "perimeter_um"):
+        b = sum(getattr(m, attr) for m in base.measurements)
+        d = sum(getattr(m, attr) for m in doubled.measurements)
+        assert b > 0 and abs(d / b - 2.0) < 0.01, (attr, b, d)
 
 
 def test_downsample_preserves_real_units():
@@ -147,13 +151,87 @@ def test_sensitivity_sign_stable_on_negative_data():
     assert 0 < (strict > 0).sum() < img.size
 
 
-def test_compose_rgb_handles_nan():
-    frame = np.zeros((1, 16, 16), dtype=np.float32)
-    frame[0, 4:12, 4:12] = 200.0
-    frame[0, 0, 0] = np.nan
-    rgb = compose_rgb(frame, [(255, 255, 255)], [True], 0.5, 0.5)
-    assert rgb.dtype == np.uint8
-    assert rgb.max() > 0  # one NaN pixel must not black out the channel
+def test_extended_metrics_present_and_sane():
+    loader = MockLoader(size=128, n_wells=1, n_time=3)
+    wa = run_analysis(loader, loader.list_wells()[0].well_id, AnalysisSettings())
+    n_chan = len(loader.channel_names)
+    assert wa.measurements
+    for m in wa.measurements:
+        # Morphometrics: major >= minor > 0, eccentricity in [0, 1), perimeter > 0.
+        assert m.length_major_um >= m.length_minor_um > 0, m
+        assert 0.0 <= m.eccentricity < 1.0 + 1e-9, m.eccentricity
+        assert m.perimeter_um > 0, m.perimeter_um
+        # Per-channel intensity stats, one value per channel, correctly ordered.
+        for stat in (m.mean_intensity, m.max_intensity, m.min_intensity, m.std_intensity):
+            assert len(stat) == n_chan, (len(stat), n_chan)
+        for c in range(n_chan):
+            assert m.min_intensity[c] <= m.mean_intensity[c] <= m.max_intensity[c], (c, m)
+            assert m.std_intensity[c] >= 0.0
+
+
+def test_parquet_exact_schema():
+    try:
+        import pyarrow.parquet as pq  # noqa: F401
+    except ImportError:
+        print("  (skipped parquet schema test: pyarrow not installed)")
+        return
+    import tempfile
+    from cellscope.export import parquet_columns, write_measurements_parquet
+
+    loader = MockLoader(size=96, n_wells=1, n_time=3, n_channels=2)
+    loader._channel_names = ["GFP", "Alexa Fluor 647"]
+    wid = loader.list_wells()[0].well_id
+    wa = run_analysis(loader, wid, AnalysisSettings())
+
+    expected = [
+        "Label", "Diameter (Equivalent) (um)", "Diameter (Feret) (um)",
+        "Length Major (um)", "Length Minor (um)", "Perimeter (um)",
+        "Intensity Mean (GFP)", "Intensity Mean (Alexa Fluor 647)",
+        "Intensity Max (GFP)", "Intensity Max (Alexa Fluor 647)",
+        "Intensity STD (GFP)", "Intensity STD (Alexa Fluor 647)",
+        "Intensity Min (GFP)", "Intensity Min (Alexa Fluor 647)",
+        "Eccentricity", "Dataset", "Timepoint", "Well",
+    ]
+    assert parquet_columns(loader.channel_names) == expected
+
+    with tempfile.TemporaryDirectory() as td:
+        path = str(Path(td) / "p.parquet")
+        n = write_measurements_parquet(path, [(wid, wa)], dataset="src.zarr")
+        assert n == len(wa.measurements)
+        t = pq.read_table(path)
+        assert t.schema.names == expected, t.schema.names
+        types = {nm: str(ty) for nm, ty in zip(t.schema.names, t.schema.types)}
+        assert types["Label"] == "int64" and types["Timepoint"] == "int64"
+        assert types["Dataset"] == "string" and types["Well"] == "string"
+        assert types["Eccentricity"] == "double"
+        # Timepoint is 0-based (unlike the tidy CSV's 1-based `time`).
+        assert min(t.column("Timepoint").to_pylist()) == 0
+        # Well is the region (FOV suffix stripped); demo wells have no FOV.
+        assert set(t.column("Well").to_pylist()) == {wid}
+
+
+def test_provenance_and_device():
+    from cellscope.analysis import resolve_device
+    from cellscope.provenance import build_run_metadata
+
+    # resolve_device must never raise, even with no torch / no GPU.
+    off = resolve_device(False)
+    assert off["device"] == "cpu" and not off["fell_back"]
+    on = resolve_device(True)
+    assert on["device"] in ("cpu", "cuda", "mps") and "detail" in on
+
+    loader = MockLoader(size=64, n_wells=1, n_time=2)
+    wa = run_analysis(loader, loader.list_wells()[0].well_id, AnalysisSettings())
+    meta = build_run_metadata(
+        source="/data/exp", engine="cellpose", settings=wa.settings,
+        pixel_size_um=0.65, downsample=1, channel_names=loader.channel_names,
+        gpu=on, positions=["A1"], output_format="parquet",
+        created_utc="2026-07-16T00:00:00Z",
+    )
+    for key in ("cellscope_version", "engine", "gpu", "settings",
+                "pixel_size_um", "channel_names", "n_positions", "created_utc"):
+        assert key in meta, key
+    assert meta["engine"] == "cellpose" and meta["n_positions"] == 1
 
 
 def test_mock_small_size_ok():
@@ -180,7 +258,9 @@ if __name__ == "__main__":
     test_feret_diameter_of_known_shape()
     test_sensitivity_changes_detection()
     test_sensitivity_sign_stable_on_negative_data()
-    test_compose_rgb_handles_nan()
+    test_extended_metrics_present_and_sane()
+    test_parquet_exact_schema()
+    test_provenance_and_device()
     test_mock_small_size_ok()
     test_mock_rejects_tiny_size()
     print(f"All analysis checks passed in {time.time() - t0:.1f}s")

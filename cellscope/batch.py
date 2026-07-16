@@ -18,19 +18,32 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import logging
 import multiprocessing as mp
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from cellscope.analysis import (
     AnalysisSettings,
     available_engines,
     cellpose_available,
+    resolve_device,
     run_analysis,
 )
 from cellscope.data import CephlaLoader, FolderLoader, MockLoader
-from cellscope.export import measurements_header, write_measurements_csv
+from cellscope.export import (
+    combine_parquet,
+    measurements_header,
+    write_measurements_csv,
+    write_measurements_parquet,
+)
+from cellscope.provenance import (
+    RUN_METADATA_NAME,
+    build_run_metadata,
+    write_run_metadata,
+)
 
 MOCK_SENTINEL = "__mock__"
 
@@ -53,17 +66,21 @@ def _safe_name(well_id: str) -> str:
 _WORKER: dict = {}
 
 
-def _init_worker(folder, settings_kw, pixel_size, downsample, out_dir, resume) -> None:
+def _init_worker(folder, settings_kw, pixel_size, downsample, out_dir, resume,
+                 fmt, dataset) -> None:
     _WORKER["loader"] = build_loader(folder)
     _WORKER["settings"] = AnalysisSettings(**settings_kw)
     _WORKER["pixel_size"] = pixel_size
     _WORKER["downsample"] = downsample
     _WORKER["out_dir"] = Path(out_dir)
     _WORKER["resume"] = resume
+    _WORKER["format"] = fmt
+    _WORKER["dataset"] = dataset
 
 
 def _analyze_one(well_id: str):
-    out = _WORKER["out_dir"] / f"{_safe_name(well_id)}.csv"
+    ext = "parquet" if _WORKER["format"] == "parquet" else "csv"
+    out = _WORKER["out_dir"] / f"{_safe_name(well_id)}.{ext}"
     if _WORKER["resume"] and out.exists() and out.stat().st_size > 0:
         return (well_id, -1, "skipped")
     try:
@@ -71,7 +88,11 @@ def _analyze_one(well_id: str):
             _WORKER["loader"], well_id, _WORKER["settings"],
             pixel_size_um=_WORKER["pixel_size"], downsample=_WORKER["downsample"],
         )
-        write_measurements_csv(str(out), [(well_id, "", wa)])
+        if _WORKER["format"] == "parquet":
+            write_measurements_parquet(str(out), [(well_id, wa)],
+                                       dataset=_WORKER["dataset"])
+        else:
+            write_measurements_csv(str(out), [(well_id, "", wa)])
         return (well_id, wa.n_tracks, "ok")
     except Exception as exc:  # noqa: BLE001 - one bad position must not kill the run
         return (well_id, 0, f"error: {exc}")
@@ -123,17 +144,26 @@ def main(argv=None) -> int:
                     help="Expected cell diameter in px (0 = auto)")
     ap.add_argument("--no-gpu", action="store_true",
                     help="Run Cellpose on CPU (slow) instead of GPU")
+    ap.add_argument("--format", choices=["csv", "parquet"], default="csv",
+                    help="Output: tidy CSV (default) or fixed-schema parquet (needs pyarrow)")
+    ap.add_argument("--dataset", default="",
+                    help="Value for the parquet 'Dataset' column (default: the source folder)")
     ap.add_argument("--sensitivity", type=float, default=0.5)
     ap.add_argument("--smoothing", type=float, default=1.5)
     ap.add_argument("--min-size", type=int, default=25)
     ap.add_argument("--seg-channel", type=int, default=0)
     ap.add_argument("--max-distance", type=float, default=30.0)
     ap.add_argument("--resume", action="store_true",
-                    help="Skip positions whose CSV already exists")
+                    help="Skip positions whose output file already exists")
     ap.add_argument("--combine", action="store_true",
-                    help="Also write one combined all_measurements.csv")
+                    help="Also write one combined all_measurements file")
     ap.add_argument("--list", action="store_true", help="List positions and exit")
     args = ap.parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.INFO, format="%(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
 
     loader = build_loader(args.folder)
     wells = _select([w.well_id for w in loader.list_wells()], args.positions)
@@ -157,17 +187,38 @@ def main(argv=None) -> int:
               file=sys.stderr)
         return 1
 
+    if args.format == "parquet":
+        try:
+            import pyarrow  # noqa: F401
+        except ImportError:
+            print("Parquet output needs pyarrow. Install it with: pip install pyarrow "
+                  "(or: pip install 'cellscope[parquet]').", file=sys.stderr)
+            return 1
+
+    # Resolve the real compute device up front so the header reflects reality:
+    # Cellpose silently falls back to CPU when the GPU is not visible to torch.
+    gpu_info = resolve_device(not args.no_gpu) if args.engine == "cellpose" else None
+
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Cellpose holds a GPU model per process, so default to ONE worker (the GPU
-    # parallelizes internally by batching frames); the threshold engine scales
-    # across CPU cores.
-    if args.jobs > 0:
-        jobs = args.jobs
-    elif args.engine == "cellpose":
+
+    # Cellpose holds a GPU model per process, so it MUST run one worker (the GPU
+    # parallelizes internally by batching frames); N workers would load N models
+    # onto one card and exhaust GPU memory. The threshold engine scales on CPU.
+    if args.engine == "cellpose":
+        if args.jobs > 1:
+            print(f"Note: --engine cellpose runs 1 worker (requested {args.jobs}); "
+                  "multiple workers load a model per process and exhaust GPU memory.",
+                  file=sys.stderr)
         jobs = 1
+    elif args.jobs > 0:
+        jobs = args.jobs
     else:
         jobs = min(mp.cpu_count() or 1, 8)
+
+    effective_pixel = (args.pixel_size if args.pixel_size is not None
+                       else loader.pixel_size_um)
+    dataset = args.dataset or (str(args.folder) if args.folder != MOCK_SENTINEL else "demo")
     settings_kw = dict(
         sensitivity=args.sensitivity, smoothing=args.smoothing,
         min_size=args.min_size, seg_channel=args.seg_channel,
@@ -176,11 +227,16 @@ def main(argv=None) -> int:
         cellpose_diameter=args.cellpose_diameter, cellpose_gpu=not args.no_gpu,
     )
     initargs = (args.folder, settings_kw, args.pixel_size, args.downsample,
-                str(out_dir), args.resume)
+                str(out_dir), args.resume, args.format, dataset)
 
-    gpu_note = (" (GPU)" if not args.no_gpu else " (CPU)") if args.engine == "cellpose" else ""
-    print(f"CellScope batch: {len(wells)} positions, engine={args.engine}{gpu_note}, "
-          f"{jobs} worker(s), downsample 1/{args.downsample}, out={out_dir}", flush=True)
+    device_note = f", {gpu_info['detail']}" if gpu_info else ""
+    print(f"CellScope batch: {len(wells)} positions, engine={args.engine}{device_note}, "
+          f"{jobs} worker(s), downsample 1/{args.downsample}, format={args.format}, "
+          f"out={out_dir}", flush=True)
+    if gpu_info and gpu_info["fell_back"]:
+        print("WARNING: GPU requested but not available - Cellpose will run on CPU "
+              "(much slower). Fix the CUDA/torch install, or pass --no-gpu to silence.",
+              file=sys.stderr, flush=True)
     t0 = time.time()
     results = []
 
@@ -210,9 +266,27 @@ def main(argv=None) -> int:
     for r in failed:
         print(f"  FAILED {r[0]}: {r[2]}", file=sys.stderr)
 
+    # Provenance sidecar: exactly how these results were produced. Comparing two
+    # of these files proves whether two runs were analyzed identically.
+    meta = build_run_metadata(
+        source=args.folder, engine=args.engine, settings=settings_kw,
+        pixel_size_um=effective_pixel, downsample=args.downsample,
+        channel_names=channel_names, gpu=gpu_info, positions=wells,
+        output_format=args.format,
+        created_utc=datetime.now(timezone.utc).isoformat(),
+        extra={"dataset": dataset},
+    )
+    write_run_metadata(str(out_dir / RUN_METADATA_NAME), meta)
+
     if args.combine:
-        combined = _combine(out_dir, wells, channel_names)
-        print(f"Combined -> {combined}", flush=True)
+        if args.format == "parquet":
+            parts = [str(out_dir / f"{_safe_name(w)}.parquet") for w in wells]
+            combined_path = out_dir / "all_measurements.parquet"
+            rows = combine_parquet(str(combined_path), parts)
+            print(f"Combined {rows} rows -> {combined_path}", flush=True)
+        else:
+            combined = _combine(out_dir, wells, channel_names)
+            print(f"Combined -> {combined}", flush=True)
 
     return 0 if not failed else 2
 

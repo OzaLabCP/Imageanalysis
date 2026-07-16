@@ -65,8 +65,15 @@ class CellMeasurement:
     area_um2: float
     equiv_diameter_um: float
     feret_diameter_um: float
+    length_major_um: float
+    length_minor_um: float
+    perimeter_um: float
+    eccentricity: float
     mean_intensity: list[float]
     total_intensity: list[float]
+    max_intensity: list[float]
+    std_intensity: list[float]
+    min_intensity: list[float]
 
 
 @dataclass
@@ -170,8 +177,15 @@ def run_analysis(
                     area_um2=m["area_um2"],
                     equiv_diameter_um=m["equiv_diameter_um"],
                     feret_diameter_um=m["feret_diameter_um"],
+                    length_major_um=m["length_major_um"],
+                    length_minor_um=m["length_minor_um"],
+                    perimeter_um=m["perimeter_um"],
+                    eccentricity=m["eccentricity"],
                     mean_intensity=m["mean_intensity"],
                     total_intensity=m["total_intensity"],
+                    max_intensity=m["max_intensity"],
+                    std_intensity=m["std_intensity"],
+                    min_intensity=m["min_intensity"],
                 )
             )
         report(64 + int(34 * (t + 1) / n_time))  # 64..98

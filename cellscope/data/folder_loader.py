@@ -21,6 +21,7 @@ Pixel data is read lazily: scanning only reads headers; full arrays are built
 
 from __future__ import annotations
 
+import logging
 import re
 import threading
 from dataclasses import dataclass, field
@@ -29,6 +30,8 @@ from pathlib import Path
 import numpy as np
 
 from cellscope.data.loader import DatasetLoader, WellInfo
+
+logger = logging.getLogger(__name__)
 
 IMAGE_EXTS = {".tif", ".tiff", ".jpg", ".jpeg", ".png"}
 TIFF_EXTS = {".tif", ".tiff"}
@@ -610,7 +613,8 @@ class FolderLoader(DatasetLoader):
         for pl in plan.planes:
             try:
                 img = _read_image(pl.path, pl.ext)
-            except Exception:
+            except Exception as exc:
+                logger.warning("skipped unreadable image, left blank: %s (%s)", pl.path, exc)
                 continue
             if pl.c == -1:  # split RGB across channels
                 if img.ndim == 2:
