@@ -234,6 +234,20 @@ def test_provenance_and_device():
     assert meta["engine"] == "cellpose" and meta["n_positions"] == 1
 
 
+def test_run_analysis_accepts_prefetched_array():
+    # Passing a prefetched array (batch overlaps disk I/O with compute) must give
+    # identical results to letting run_analysis load it.
+    loader = MockLoader(size=96, n_wells=1, n_time=2)
+    wid = loader.list_wells()[0].well_id
+    a = run_analysis(loader, wid, AnalysisSettings())
+    b = run_analysis(loader, wid, AnalysisSettings(),
+                     array=loader.get_well(wid, downsample=1))
+    assert a.n_tracks == b.n_tracks
+    assert len(a.measurements) == len(b.measurements)
+    assert abs(sum(m.area_um2 for m in a.measurements)
+               - sum(m.area_um2 for m in b.measurements)) < 1e-6
+
+
 def test_cephla_pixel_size_tube_lens_correction():
     from cellscope.data.cephla_loader import _pixel_size_from_params
     # Real Squid params: 20x nominal, but a 50 mm tube lens vs its 180 mm design
@@ -313,6 +327,7 @@ if __name__ == "__main__":
     test_extended_metrics_present_and_sane()
     test_parquet_exact_schema()
     test_provenance_and_device()
+    test_run_analysis_accepts_prefetched_array()
     test_cephla_pixel_size_tube_lens_correction()
     test_cephla_flat_single_timepoint_folder()
     test_mock_small_size_ok()
