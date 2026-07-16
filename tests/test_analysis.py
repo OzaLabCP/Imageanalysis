@@ -409,6 +409,65 @@ def test_qc_report():
         assert "QC:" in format_issues(rep2)
 
 
+def test_fog_plot_script():
+    try:
+        import pandas as pd
+        import matplotlib  # noqa: F401
+        import pyarrow  # noqa: F401
+    except ImportError:
+        print("  (skipped fog_plot test: pandas/matplotlib/pyarrow not installed)")
+        return
+    import importlib.util
+    import os
+    import tempfile
+
+    fp_path = Path(__file__).resolve().parents[1] / "scripts" / "fog_plot.py"
+    spec = importlib.util.spec_from_file_location("fog_plot", fp_path)
+    fog = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fog)
+
+    # Case-insensitive column resolution (so --facet-by Condition finds condition).
+    df0 = pd.DataFrame({"Well": ["H2"], "condition": ["A"], "Timepoint": [0]})
+    assert fog._resolve_column(df0, "Condition") == "condition"
+    assert fog._resolve_column(df0, "nope") is None
+
+    # Non-positive counting (invisible on a log axis): zeros + negatives + NaN.
+    assert fog._count_nonpositive([1.0, 0.0, -3.0, float("nan"), 5.0]) == 3
+
+    with tempfile.TemporaryDirectory() as d:
+        # Uneven coverage: 3 positions (H2-0/H2-1/H3-0) all reach TP0, but only one
+        # reaches TP1 - the exact "partial late timepoint" trap.
+        rows = []
+        for (well, fov), tmax in {("H2", "0"): 1, ("H2", "1"): 0, ("H3", "0"): 0}.items():
+            for t in range(tmax + 1):
+                for _ in range(20):
+                    rows.append((well, fov, "Drug with a very long condition name",
+                                 t, 100.0 + t, 0.0 if _ == 0 else 500.0))
+        df = pd.DataFrame(rows, columns=[
+            "Well", "fov", "condition", "Timepoint",
+            "Intensity Mean (488 nm)", "Intensity Mean (638 nm)"])
+        p = os.path.join(d, "m.parquet")
+        df.to_parquet(p)
+
+        per, total = fog._coverage(df)
+        assert total == 3 and per == {0: 3, 1: 1}, (per, total)
+
+        # A channel with exact-zero cells (638) is flagged, not silently dropped.
+        assert fog._count_nonpositive(df["Intensity Mean (638 nm)"].to_numpy(float)) > 0
+
+        # Faceting by the (long-named, case-different) condition renders and exits 0.
+        out = os.path.join(d, "fog.png")
+        rc = fog.main([p, "-o", out, "--facet-by", "Condition",
+                       "--channel", "Intensity Mean (638 nm)", "--control",
+                       "Drug with a very long condition name"])
+        assert rc == 0 and os.path.exists(out)
+
+        # An unknown --facet-by errors loudly (exit 2) instead of silently pooling.
+        assert fog.main([p, "-o", out, "--facet-by", "Treatment"]) == 2
+        # An unknown --channel errors loudly too.
+        assert fog.main([p, "-o", out, "--channel", "Intensity Mean (999 nm)"]) == 2
+
+
 def test_cephla_multi_timepoint_folders():
     import json
     import tempfile
@@ -471,6 +530,7 @@ if __name__ == "__main__":
     test_cephla_flat_single_timepoint_folder()
     test_cephla_multi_timepoint_folders()
     test_qc_report()
+    test_fog_plot_script()
     test_analyze_report()
     test_mock_small_size_ok()
     test_mock_rejects_tiny_size()

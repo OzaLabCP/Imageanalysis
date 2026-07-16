@@ -42,6 +42,15 @@ def _colors(groups) -> dict:
     return {g: _PALETTE[i % len(_PALETTE)] for i, g in enumerate(groups)}
 
 
+def _panel_title(ax, label, suffix=""):
+    """Wrapped, size-adapting facet title so long condition names don't clip."""
+    import textwrap
+    label = str(label)
+    fs = 11 if len(label) <= 18 else (10 if len(label) <= 28 else 9)
+    wrapped = "\n".join(textwrap.wrap(label, 24)) or label
+    ax.set_title(f"{wrapped}{suffix}", color=_INK, fontsize=fs, weight="bold", loc="left")
+
+
 def _resolve_channel(df, channel):
     if channel in df.columns:
         return channel
@@ -126,7 +135,7 @@ def _fig_fog_over_time(df, channel, groups, tvals, thr, out):
         ax.set_ylim(ylim)
         ax.set_xticks(range(len(tvals)))
         ax.set_xticklabels(tvals)
-        ax.set_title(f"{g}   (n={len(sub):,})", color=_INK, fontsize=11, weight="bold", loc="left")
+        _panel_title(ax, g, f"   (n={len(sub):,})")
         _style(ax)
     for k in range(len(groups), nrow * ncol):
         axes[k // ncol][k % ncol].axis("off")
@@ -165,7 +174,7 @@ def _fig_distributions(df, channel, groups, tvals, thr, out):
         ax.axhline(np.log10(thr), color="#d1495b", lw=1.1, ls="--")
         ax.set_xticks(positions)
         ax.set_xticklabels(tvals)
-        ax.set_title(f"{g}", color=_INK, fontsize=11, weight="bold", loc="left")
+        _panel_title(ax, g)
         _style(ax)
     for k in range(len(groups), nrow * ncol):
         axes[k // ncol][k % ncol].axis("off")
