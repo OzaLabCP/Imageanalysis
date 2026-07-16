@@ -21,6 +21,7 @@ dependencies = [
 [project.scripts]
 cellscope = "cellscope.app:main"
 cellscope-batch = "cellscope.batch:main"
+cellscope-downsample = "cellscope.downsample:main"
 
 [tool.setuptools.packages.find]
 include = ["cellscope*"]

@@ -140,10 +140,11 @@ def _real_folder_metadata_check():
     real = Path(r"C:\Users\joza\OneDrive - Cal Poly\Oza Lab - Shared 2"
                 r"\synthetic-cell-imaging\tiff_files_for_imaging"
                 r"\2026.06.26-gm-ppk2_2026-06-26_12-56-06.391058")
-    if not real.exists():
-        print("[skip] real Cephla folder not present")
+    # The folder entry can exist while OneDrive has dehydrated its contents, so
+    # skip unless it is actually readable as a Cephla acquisition.
+    if not real.exists() or not CephlaLoader.looks_like(real):
+        print("[skip] real Cephla folder not present / not accessible")
         return
-    assert CephlaLoader.looks_like(real)
     loader = CephlaLoader(str(real))
     wells = loader.list_wells()
     print(f"[real] {len(wells)} positions, channels={loader.channel_names}, "

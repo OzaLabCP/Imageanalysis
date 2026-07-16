@@ -138,6 +138,14 @@ class CephlaLoader(DatasetLoader):
             return {}
 
     def _compute_pixel_size(self, params: dict) -> float:
+        # An explicit pixel_size_um wins (e.g. written by cellscope-downsample so
+        # a reduced-resolution copy reports its true effective pixel size).
+        explicit = params.get("pixel_size_um")
+        try:
+            if explicit and float(explicit) > 0:
+                return float(explicit)
+        except (TypeError, ValueError):
+            pass
         sensor = params.get("sensor_pixel_size_um")
         obj = params.get("objective") or {}
         mag = obj.get("magnification") if isinstance(obj, dict) else None
