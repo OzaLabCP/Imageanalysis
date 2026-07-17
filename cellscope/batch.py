@@ -175,8 +175,11 @@ def main(argv=None) -> int:
                     help="Parallel workers (0 = auto). Each worker holds ~1 position in RAM.")
     ap.add_argument("--positions", default=None,
                     help="Comma-separated ids or glob patterns, e.g. 'B2-*,B3-0'")
-    ap.add_argument("--downsample", type=int, default=1,
-                    help="Analyze at 1/N resolution for speed (measurements stay in microns)")
+    ap.add_argument("--downsample", type=int, default=4,
+                    help="Analyze at 1/N resolution for speed; measurements stay in real "
+                         "microns (the pixel size is scaled). DEFAULT 4, validated for this "
+                         "lab's acquisitions (cells stay well-resolved at ~1.3 um/px). "
+                         "Pass --downsample 1 for full resolution / the finest morphometrics.")
     ap.add_argument("--pixel-size", type=float, default=None,
                     help="Microns per full-res pixel (default: from the acquisition metadata)")
     ap.add_argument("--engine", default="threshold", choices=["threshold", "cellpose"],

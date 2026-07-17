@@ -154,10 +154,18 @@ python -m cellscope.batch "/data/exp" -o out -j 8        # module form
 ```
 
 Options: `-j/--jobs` (workers), `--positions "B2-*,B3-0"` (glob subset),
-`--downsample N` (fast lower-res pass; measurements stay in microns),
-`--pixel-size`, `--sensitivity`/`--min-size`/`--seg-channel`/`--max-distance`,
+`--downsample N` (**default 4**; analyze at 1/N resolution — measurements stay in
+real microns because the pixel size is scaled), `--pixel-size`,
+`--sensitivity`/`--min-size`/`--seg-channel`/`--max-distance`,
 `--resume` (skip finished positions), `--combine`, `--list`,
 `--format csv|parquet`, `--dataset <name>`.
+
+> **Downsampling defaults to 4×.** For this lab's acquisitions a 4× reduction is
+> validated to leave cells well-resolved (~1.3 µm/px) while cutting analysis time
+> substantially, so it's the default. The factor is printed in the run header
+> (`downsample 1/4`) and recorded in `run_metadata.json`, so it's never silent.
+> Pass **`--downsample 1`** for full resolution / the finest morphometrics, or
+> `--downsample 2` for a middle ground.
 
 Every run also writes a **`run_metadata.json`** provenance sidecar into the output
 folder recording exactly how the results were produced (engine, settings, pixel
