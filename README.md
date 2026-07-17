@@ -265,13 +265,26 @@ droplets) the deep-learning **Cellpose** engine gives far better masks. Run it o
 a machine with an **NVIDIA GPU**, with the data on that machine's local disk — so
 nothing has to be transferred to a remote GPU.
 
-**Install (on the GPU machine, once):**
+**Install (on the GPU machine, once).** Order matters: install CellScope +
+Cellpose first, then (re)install the CUDA build of PyTorch **last**, so Cellpose
+can't pull a CPU-only torch over the top of it.
 ```bash
-# 1) a CUDA build of PyTorch for your GPU  (see https://pytorch.org for the exact line)
-pip install torch --index-url https://download.pytorch.org/whl/cu124
-# 2) CellScope with the Cellpose extra
-pip install "cellscope[cellpose]"
+# 1) Python 3.10-3.12 (3.13/3.14 may not have wheels yet); a fresh venv is cleanest.
+pip install "cellscope[cellpose]" packaging
+
+# 2) A CUDA build of PyTorch MATCHING YOUR GPU, installed last. Pick the index-url:
+#      RTX 50-series (Blackwell, e.g. 5080/5090)  -> cu128   (cu124 will NOT work)
+#      RTX 30/40-series and most others           -> cu124
+#    See https://pytorch.org for the exact current line.
+pip install torch --index-url https://download.pytorch.org/whl/cu128 \
+    --force-reinstall --no-deps
+
+# 3) Verify torch actually sees the GPU (must print: True  12.8):
+python -c "import torch; print(torch.cuda.is_available(), torch.version.cuda)"
 ```
+If step 3 prints `False`, the CUDA/torch build doesn't match your driver — fix
+that before running, or CellScope will fall back to CPU (and say so). The batch
+header prints the resolved device so you can confirm it picked the GPU.
 
 **Run it — headless batch:**
 ```bash
