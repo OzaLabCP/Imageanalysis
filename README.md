@@ -17,6 +17,63 @@ images never leave your disk.
 
 ---
 
+## Pipeline at a glance
+
+Point CellScope at a folder of images and **one command** carries it all the way
+to figures — segment, track, measure, quality-check, and plot. Measurements stay
+in real microns at every step, and the run warns loudly whenever the input is off
+rather than emitting plausible-looking wrong numbers.
+
+```bash
+cellscope-batch "path/to/acquisition" -o results --engine cellpose --format parquet --analyze
+```
+
+1. **Intake** — auto-detects the folder layout (Cephla/Squid, OME-TIFF, or a plain
+   folder of frames) and the list of positions to analyze. No config.
+2. **Metadata** — reads channels, timepoints, and the **tube-lens-corrected pixel
+   size** from the acquisition, so everything downstream is in real microns.
+3. **Load** — pulls each position's `(Time, Z, Channel, Y, X)` stack; optional
+   **downsampling (default 4×)** for speed, with the pixel size scaled to match.
+4. **Segment** — turns each frame into labeled cells (Otsu threshold by default, or
+   the **Cellpose** GPU model with `--engine cellpose`).
+5. **Track** — links cells across consecutive frames into stable per-cell IDs; a
+   `segment` column marks gaps so a track is never joined across a missing frame.
+6. **Quantify** — per cell, per frame: area, equivalent/Feret diameter, axis
+   lengths, perimeter, eccentricity, centroid, and per-channel intensity
+   (mean/total/max/min/std). A blank channel is recorded as **NaN**, never `0.0`.
+7. **Export + combine** — one row per cell per timepoint, keyed uniquely by
+   `(Dataset, Well, fov, Timepoint, Label)`, merged into `all_measurements.parquet`.
+8. **QC** — scans the table for silent-corruption modes (key collisions, blank
+   channels, saturation, timepoint coverage) and writes `qc.json` + a summary.
+9. **Provenance** — writes `run_metadata.json`: git commit, engine, GPU, pixel
+   size, downsample factor, and positions, so any run is reproducible and diffable.
+10. **Analyze** (`--analyze`) — gates cells, sets a data-driven responder threshold,
+    groups by well (or by condition via `--platemap`), and renders the report:
+    **fog plots** (per-cell intensity over time), responder-fraction, distributions,
+    percentile bands, characterization, CSV summaries, and an `index.html`.
+
+**What lands in `results/`:**
+
+```
+results/
+├─ H2-0.parquet, H2-1.parquet, …   # per-position measurements
+├─ all_measurements.parquet        # master table: one row per cell per timepoint
+├─ qc.json                         # data-integrity report
+├─ run_metadata.json               # exact provenance (code, GPU, pixel size, downsample)
+└─ report/
+   ├─ fog_over_time.png             # the fog plots
+   ├─ responder_fraction.png, distributions_over_time.png, percentile_bands.png, …
+   ├─ group_timepoint_summary.csv, responder_characteristics.csv
+   └─ index.html                    # open this
+```
+
+The headless batch above needs `pip install "cellscope[cellpose,analysis]"` (see
+[Running headless](#running-headless-on-a-compute-server-batch) and
+[Cellpose](#better-masks-with-cellpose-local-gpu)). Prefer clicking to typing? The
+same detect → track → quantify engine runs behind the **desktop app** below.
+
+---
+
 ## Install and run (for non-developers)
 
 You need **Python 3.10 or newer** installed. Then open a terminal (Command Prompt
