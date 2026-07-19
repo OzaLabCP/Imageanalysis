@@ -335,7 +335,7 @@ Cellpose first, then (re)install the CUDA build of PyTorch **last**, so Cellpose
 can't pull a CPU-only torch over the top of it.
 ```bash
 # 1) Python 3.10-3.12 (3.13/3.14 may not have wheels yet); a fresh venv is cleanest.
-pip install "cellscope[cellpose]" packaging
+pip install "cellscope[cellpose,analysis]" packaging
 
 # 2) A CUDA build of PyTorch MATCHING YOUR GPU, installed last. Pick the index-url:
 #      RTX 50-series (Blackwell, e.g. 5080/5090)  -> cu128   (cu124 will NOT work)
