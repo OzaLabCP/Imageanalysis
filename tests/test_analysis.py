@@ -314,6 +314,76 @@ def test_cephla_flat_single_timepoint_folder():
         assert CephlaLoader.looks_like(p2) is False
 
 
+def test_subpopulation_stats_pure_helpers():
+    from cellscope.stats import benjamini_hochberg, bimodality_coefficient, cliffs_delta
+    rng = np.random.default_rng(0)
+    bimodal = np.concatenate([rng.normal(0, 0.3, 400), rng.normal(6, 0.3, 400)])
+    unimodal = rng.normal(0, 1, 800)
+    assert bimodality_coefficient(bimodal) > 0.555
+    assert bimodality_coefficient(unimodal) < 0.555
+    assert cliffs_delta([5, 6, 7, 8], [1, 2, 3, 4]) == 1.0
+    assert cliffs_delta([1, 2, 3], [1, 2, 3]) == 0.0
+    # BH: monotone, never below the raw p, clipped to 1.
+    adj = benjamini_hochberg([0.01, 0.02, 0.03, 0.04])
+    assert adj == sorted(adj) and all(a >= r for a, r in zip(adj, [0.01, 0.02, 0.03, 0.04]))
+
+
+def test_subpopulation_stats_well_level():
+    try:
+        import pandas as pd
+        import scipy  # noqa: F401
+    except ImportError:
+        print("  (skipped subpopulation stats test: pandas/scipy not installed)")
+        return
+    from cellscope.stats import subpopulation_stats
+
+    rng = np.random.default_rng(1)
+    rows = []
+    # Two conditions, THREE wells each (biological replicates), two FOVs per well,
+    # five timepoints. Drug grows a responder subpopulation and ramps up; Vehicle
+    # stays flat. Cells persist across timepoints so trajectories are real.
+    w = 0
+    for cond, fmax in (("Drug", 0.45), ("Vehicle", 0.03)):
+        for _well in range(3):
+            well = f"W{w}"; w += 1
+            for fov in ("0", "1"):
+                n = 150
+                base = rng.lognormal(7.1, 0.4, n)
+                resp = rng.random(n) < fmax
+                for t in range(5):
+                    for c in range(n):
+                        rate = 0.28 if resp[c] else 0.01
+                        val = base[c] * (10 ** (rate * t)) * rng.lognormal(0, 0.12)
+                        rows.append((well, fov, cond, t, 0, c + 1, float(val)))
+    df = pd.DataFrame(rows, columns=["Well", "fov", "condition", "Timepoint",
+                                     "segment", "Label", "Intensity Mean (488 nm)"])
+    df["Dataset"] = "demo"
+    df["group"] = df["condition"]
+    thr = 10 ** np.mean([np.log10(df["Intensity Mean (488 nm)"].quantile(q))
+                         for q in (0.5, 0.95)])
+
+    rep = subpopulation_stats(df, "Intensity Mean (488 nm)", thr, group_col="group")
+    # The well is the replication unit (not the 45,000 cells) -> n=3 per condition.
+    assert rep["replication_unit"] == "well", rep["replication_unit"]
+    resp = rep["responder_pct_by_condition"]
+    assert resp["n_units"] == {"Drug": 3, "Vehicle": 3}, resp["n_units"]
+    assert resp["medians"]["Drug"] > resp["medians"]["Vehicle"] + 10
+    # Perfect separation of 3 vs 3 -> Cliff's delta 1 and the floor p-value 0.1.
+    pair = resp["pairwise"][0]
+    assert pair["cliffs_delta"] == 1.0
+    assert abs(pair["p_value"] - 0.1) < 1e-6, pair["p_value"]
+    # Trajectories exist and Drug ramps faster than Vehicle.
+    tr = rep["trajectory_slope_by_condition"]
+    assert tr["medians"]["Drug"] > tr["medians"]["Vehicle"]
+    assert rep["n_cells_with_trajectory"] > 0
+
+    # Single well per condition -> the unit drops to FOV with a loud caveat.
+    one = df[df["Well"].isin(["W0", "W3"])].copy()
+    rep1 = subpopulation_stats(one, "Intensity Mean (488 nm)", thr, group_col="group")
+    assert rep1["replication_unit"] == "fov"
+    assert rep1["replication_caveat"] and "technical" in rep1["replication_caveat"].lower()
+
+
 def test_analyze_report():
     try:
         import pandas as pd
@@ -569,6 +639,8 @@ if __name__ == "__main__":
     test_segment_map_marks_gaps()
     test_qc_report()
     test_fog_plot_script()
+    test_subpopulation_stats_pure_helpers()
+    test_subpopulation_stats_well_level()
     test_analyze_report()
     test_mock_small_size_ok()
     test_mock_rejects_tiny_size()

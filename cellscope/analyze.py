@@ -63,10 +63,23 @@ def _resolve_channel(df, channel):
 
 
 def _load(parquet: str, platemap: str | None, channel: str):
+    """Load the parquet and assign each row a ``group`` for comparison.
+
+    Grouping priority: an explicit ``--platemap`` file wins; otherwise the
+    ``condition`` column the pipeline now writes into the parquet is used (so a
+    run acquired with a plate map groups by condition automatically); otherwise
+    each ``Well`` is its own group."""
     import pandas as pd
     df = pd.read_parquet(parquet)
     channel = _resolve_channel(df, channel)
     df["Well"] = df["Well"].astype(str)
+
+    def _has_condition():
+        if "condition" not in df.columns:
+            return False
+        c = df["condition"].astype(str).str.strip()
+        return c.replace({"nan": "", "None": ""}).ne("").any()
+
     if platemap and os.path.exists(platemap):
         pm = pd.read_csv(platemap)
         cols = {c.lower().strip(): c for c in pm.columns}
@@ -77,6 +90,9 @@ def _load(parquet: str, platemap: str | None, channel: str):
             df["group"] = df["Well"].map(mapping).fillna(df["Well"])
         else:
             df["group"] = df["Well"]
+    elif _has_condition():
+        cond = df["condition"].astype(str).str.strip().replace({"nan": "", "None": ""})
+        df["group"] = cond.where(cond.ne(""), df["Well"])
     else:
         df["group"] = df["Well"]
     return df, channel
@@ -260,6 +276,73 @@ def _fig_responder_characterization(df, channel, thr, out):
     plt.close(fig)
 
 
+def _annotate_p(ax, block, groups):
+    """Draw the test's p-value(s) above a comparison panel."""
+    if not block or not block.get("pairwise"):
+        return
+    if len(groups) == 2 and block["pairwise"]:
+        pr = block["pairwise"][0]
+        p = pr.get("p_adj_bh", pr.get("p_value"))
+        txt = f"Mann-Whitney p = {p:.3g}  (Cliff's d = {pr['cliffs_delta']:+.2f})"
+    else:
+        op = block.get("omnibus_p")
+        txt = f"Kruskal-Wallis p = {op:.3g}" if op == op else "n/a"
+    # inside the axes, top-centre, so it never collides with the axis/sup titles
+    ax.text(0.5, 0.97, txt, transform=ax.transAxes, ha="center", va="top",
+            fontsize=9, color=_INK2,
+            bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#dddddd", lw=0.8))
+
+
+def _fig_superplot(df, channel, thr, stat, out):
+    """Superplot: cells shown faintly, per-well values as big dots (the unit that
+    is actually tested). Makes n = wells, not cells, visually honest."""
+    import matplotlib.pyplot as plt
+    tp = stat["comparison_timepoint"]
+    unit_cols = [c for c in stat["replication_unit_columns"] if c in df.columns]
+    end = df[df["Timepoint"] == tp]
+    groups = sorted(end["group"].unique())
+    if not groups or not unit_cols:
+        return False
+    colors = _colors(groups)
+    rng = np.random.default_rng(0)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11.5, 5.4), dpi=140)
+
+    for i, g in enumerate(groups):
+        sub = end[end["group"] == g]
+        y = sub[channel].to_numpy(float); y = y[np.isfinite(y) & (y > 0)]
+        ax1.scatter(i + (rng.random(y.size) - .5) * .55, y, s=4, c="#c2c2c2",
+                    alpha=0.06, linewidths=0, rasterized=True)
+        resp_pts = []
+        for _, u in sub.groupby(unit_cols):
+            uy = u[channel].to_numpy(float); uy = uy[np.isfinite(uy) & (uy > 0)]
+            if uy.size:
+                ax1.scatter(i + (rng.random() - .5) * .3, np.median(uy), s=95,
+                            color=colors[g], edgecolor=_INK, linewidths=1.2, zorder=5)
+                resp_pts.append(100.0 * float(np.mean(uy > thr)))
+        for rp in resp_pts:
+            ax2.scatter(i + (rng.random() - .5) * .3, rp, s=95, color=colors[g],
+                        edgecolor=_INK, linewidths=1.2, zorder=5)
+    ax1.set_yscale("log")
+    ax1.set_xticks(range(len(groups))); ax1.set_xticklabels(groups)
+    ax1.set_ylabel(f"{channel} at TP{tp} (log)", color=_INK2)
+    ax1.set_title("Endpoint intensity (big = wells, small = cells)",
+                  color=_INK, fontsize=10.5, weight="bold", loc="left")
+    _annotate_p(ax1, stat.get("median_intensity_by_condition"), groups)
+    _style(ax1)
+    ax2.set_xticks(range(len(groups))); ax2.set_xticklabels(groups)
+    ax2.set_ylabel(f"% responders at TP{tp}", color=_INK2)
+    ax2.set_title("Responder fraction (each dot = one well)",
+                  color=_INK, fontsize=10.5, weight="bold", loc="left")
+    _annotate_p(ax2, stat.get("responder_pct_by_condition"), groups)
+    _style(ax2)
+    fig.suptitle("Subpopulation comparison at the well level (not the cell)",
+                 color=_INK, fontsize=13, weight="bold", x=.01, ha="left")
+    fig.tight_layout(rect=(0.01, 0.01, 1, 0.92))
+    fig.savefig(out, facecolor="white")
+    plt.close(fig)
+    return True
+
+
 def run(parquet, outdir, platemap=None, channel=GREEN_DEFAULT,
         min_diameter=6.0, max_eccentricity=0.95):
     """Generate the full report into ``outdir``. Returns a summary dict."""
@@ -335,19 +418,80 @@ def run(parquet, outdir, platemap=None, channel=GREEN_DEFAULT,
                                     os.path.join(outdir, "responder_characterization.png"))
     figs.append(("responder_characterization.png", "What the responders are"))
 
+    # --- inferential statistics (well-level, not cell-level) --------------
+    # The figures above are descriptive; this tests whether the differences are
+    # real, using the WELL as the replication unit (cells are pseudo-replicates).
+    stat = None
+    if len(groups) > 1:
+        try:
+            import json as _json
+            from cellscope.stats import subpopulation_stats
+            stat = subpopulation_stats(df, channel, thr, group_col="group")
+            with open(os.path.join(outdir, "subpopulation_stats.json"), "w",
+                      encoding="utf-8") as f:
+                _json.dump(stat, f, indent=2)
+            if _fig_superplot(df, channel, thr, stat,
+                              os.path.join(outdir, "subpopulation_superplot.png")):
+                figs.insert(0, ("subpopulation_superplot.png",
+                                "Well-level comparison (each big dot = one well, the unit tested)"))
+        except Exception as exc:  # noqa: BLE001 - stats must not break the report
+            stat = {"error": str(exc)}
+
     # --- html report ------------------------------------------------------
     n_resp = int(df["responder"].sum())
-    grouped = "condition" if (platemap and os.path.exists(platemap)) else "well"
+    grouped = "well" if df["group"].astype(str).equals(df["Well"].astype(str)) else "condition"
     _write_html(outdir, parquet, channel, thr, len(raw), len(df), n_resp,
-                grouped, groups, tvals, summary, figs, qc)
+                grouped, groups, tvals, summary, figs, qc, stat)
     return {"cells_total": len(raw), "cells_gated": len(df), "responders": n_resp,
             "threshold": thr, "groups": groups, "timepoints": tvals,
             "qc_ok": (qc.get("ok") if qc else None),
-            "qc_issues": (qc.get("issues") if qc else [])}
+            "qc_issues": (qc.get("issues") if qc else []),
+            "stats": stat}
+
+
+def _stats_html(stat, esc):
+    """Render the inferential result as a bordered block (or nothing)."""
+    if not stat or stat.get("error"):
+        return ""
+    unit = stat.get("replication_unit", "?")
+    tp = stat.get("comparison_timepoint")
+    up, ut = stat.get("units_at_comparison_timepoint"), stat.get("units_total")
+    head = (f"<b>Statistics</b> &middot; tested at the <b>{esc(str(unit))}</b> level "
+            f"(n = {up}/{ut} units at timepoint {tp}) &middot; non-parametric, "
+            "cells pooled per well first (no pseudo-replication)")
+
+    def block(title, b):
+        if not b:
+            return ""
+        rows = ""
+        for pr in b.get("pairwise", []):
+            p = pr.get("p_adj_bh", pr.get("p_value"))
+            sig = "&#9679;" if (isinstance(p, float) and p == p and p < 0.05) else ""
+            rows += (f"<tr><td>{esc(str(pr['a']))} vs {esc(str(pr['b']))}</td>"
+                     f"<td>{'n/a' if p is None or p!=p else f'{p:.3g}'} {sig}</td>"
+                     f"<td>{pr['cliffs_delta']:+.2f}</td>"
+                     f"<td>{pr['median_diff']:+.3g}</td></tr>")
+        meds = " &middot; ".join(f"{esc(str(g))}: {m:.3g} (n={b['n_units'].get(g,0)})"
+                                 for g, m in b.get("medians", {}).items())
+        warn = "".join(f"<div style='color:#8a5000'>&#9888; {esc(w)}</div>"
+                       for w in b.get("warnings", []))
+        tbl = (f"<table><tr><th>comparison</th><th>p (BH-adj)</th>"
+               f"<th>Cliff's d</th><th>&Delta;median</th></tr>{rows}</table>" if rows else "")
+        return (f"<p style='margin:.4em 0 .1em'><b>{esc(title)}</b> "
+                f"<span style='color:#666'>({esc(b.get('test',''))})</span><br>"
+                f"<span style='color:#444'>{meds}</span></p>{tbl}{warn}")
+
+    body = (block("Responder fraction", stat.get("responder_pct_by_condition"))
+            + block("Median intensity", stat.get("median_intensity_by_condition"))
+            + block("Ramp rate (trajectory slope)", stat.get("trajectory_slope_by_condition")))
+    notes = "".join(f"<li>{esc(n)}</li>" for n in stat.get("notes", []))
+    notes = f"<ul style='color:#666;margin:.3em 0'>{notes}</ul>" if notes else ""
+    return ("<div style='background:#eef4fb;border:1px solid #b8d4f0;border-radius:6px;"
+            f"padding:8px 12px;margin:10px 0'>{head}{body}{notes}</div>")
 
 
 def _write_html(outdir, parquet, channel, thr, n_raw, n_gated, n_resp,
-                grouped, groups, tvals, summary, figs, qc=None):
+                grouped, groups, tvals, summary, figs, qc=None, stat=None):
     import pandas as pd  # noqa: F401
     esc = html.escape
     parts = [
@@ -360,7 +504,8 @@ def _write_html(outdir, parquet, channel, thr, n_raw, n_gated, n_resp,
         f"&middot; {n_resp:,} responders ({100.0*n_resp/max(1,n_gated):.1f}%)</p>",
         "<p style='color:#666'>A subpopulation shows up as a second (high) mode in the "
         "distribution and as a rising responder fraction / top decile in some groups but "
-        "not others. Population-level (no single-cell tracking).</p>",
+        "not others. Significance is tested per well (see Statistics), and per-cell ramp "
+        "rates use the tracked-cell trajectories the schema now supports.</p>",
     ]
     # QC banner: green if clean, amber with the specific issues if not. Silent
     # data corruption is the failure mode this whole exercise exists to catch, so
@@ -376,6 +521,7 @@ def _write_html(outdir, parquet, channel, thr, n_raw, n_gated, n_resp,
                          "border-radius:6px;padding:8px 12px;margin:10px 0;color:#8a5000'>"
                          f"<b>&#9888; QC: {len(qc.get('issues', []))} data-integrity "
                          f"issue(s)</b> (see qc.json)<ul>{items}</ul></div>")
+    parts.append(_stats_html(stat, esc))
     for fname, caption in figs:
         parts.append(f"<h3>{esc(caption)}</h3><img src='{esc(fname)}' style='max-width:100%'>")
     parts.append("<h3>Per-group, per-timepoint summary</h3>")

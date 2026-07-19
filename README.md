@@ -48,9 +48,11 @@ cellscope-batch "path/to/acquisition" -o results --engine cellpose --format parq
 9. **Provenance** — writes `run_metadata.json`: git commit, engine, GPU, pixel
    size, downsample factor, and positions, so any run is reproducible and diffable.
 10. **Analyze** (`--analyze`) — gates cells, sets a data-driven responder threshold,
-    groups by well (or by condition via `--platemap`), and renders the report:
-    **fog plots** (per-cell intensity over time), responder-fraction, distributions,
-    percentile bands, characterization, CSV summaries, and an `index.html`.
+    groups by condition (from the parquet or `--platemap`), and renders the report:
+    **fog plots** (per-cell intensity over time), a **well-level superplot with
+    proper statistics** (tested across wells, not cells — no pseudo-replication),
+    responder-fraction, distributions, percentile bands, per-cell ramp-rate
+    trajectories, CSV + JSON summaries, and an `index.html`.
 
 **What lands in `results/`:**
 
@@ -291,23 +293,35 @@ cellscope-batch "/data/exp" -o results --engine cellpose --format parquet --anal
 cellscope-analyze results/all_measurements.parquet -o results/report --platemap plate.csv
 ```
 
-`--platemap` is an optional CSV with `well,condition` columns (e.g. `H2,Drug A`)
-so every figure is grouped by condition; without it, results group by well. The
-report (`report/index.html`) contains:
+Grouping by **condition** happens automatically when the parquet carries a
+`condition` column (the batch runner threads a plate map through, so a run
+acquired with one groups by condition with no extra step); `--platemap`
+(`well,condition` CSV, e.g. `H2,Drug A`) overrides it, and without either the
+report groups by well. The report (`report/index.html`) contains:
 
+- **Subpopulation statistics** (`subpopulation_stats.json`, `subpopulation_superplot.png`) -
+  the inferential answer. Cells are pooled into a per-well value and every test
+  runs **across wells, not cells**, so significance isn't faked by counting
+  thousands of correlated cells (pseudo-replication). Reports responder fraction,
+  median intensity, and **per-cell ramp rate** (trajectory slope) per condition,
+  with Mann-Whitney U / Kruskal-Wallis + BH-corrected pairwise tests, Cliff's delta
+  effect sizes, and bootstrap CIs. A **superplot** shows each well as a big dot
+  (the unit tested) over the faint cells. When only one well exists per condition
+  it drops to the FOV level and says so loudly (technical, not biological,
+  replicates); it also reports **bimodality** per group so a unimodal distribution
+  (where the responder gate is meaningless) is visible.
 - **Fog over time** - per group, one dot per cell, x = time, with the responder gate drawn.
 - **Distributions over time** - per-timepoint violins; two modes reveal a subpopulation.
-- **Responder fraction over time** - the headline: % of cells above a data-driven
-  (Otsu-on-log) gate, per group - directly shows a better-behaving subpopulation
-  growing in some conditions and not others.
+- **Responder fraction over time** - % of cells above a data-driven (Otsu-on-log)
+  gate, per group over time.
 - **Percentile bands** - median vs top decile (p90); a rising tail flags responders.
 - **Responder characterization** - how the high-green cells differ in size / red / shape.
 - **CSV summaries** (`group_timepoint_summary.csv`, `responder_characteristics.csv`)
   ready for Prism/R/Excel.
 
-The report is population-level: because the parquet pools fields of view, it does
-not follow individual cells' trajectories (add a globally-unique cell id to the
-exporter first if you need true single-cell tracks).
+Per-cell **trajectories** (the ramp-rate metric) use the globally-unique cell id
+`(Dataset, Well, fov, segment, Label)` the schema now provides, built only within
+a gap-free `segment` so a track is never fused across a missing frame.
 
 The output CSV includes a **`region`** column (well without the field-of-view
 suffix) so you can pool per well directly in pandas/seaborn. Analyzing positions
