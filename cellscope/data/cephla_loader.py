@@ -21,6 +21,7 @@ with no ruler calibration needed.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
 from collections import OrderedDict
@@ -30,6 +31,8 @@ from pathlib import Path
 import numpy as np
 
 from cellscope.data.loader import DatasetLoader, WellInfo
+
+logger = logging.getLogger(__name__)
 
 _WAVELENGTH_COLORS = [
     (405, (150, 130, 255)),
@@ -65,6 +68,50 @@ def _channel_label(chan_key: str) -> str:
     return chan_key.replace("_", " ").strip()
 
 
+def _is_cephla_name(stem: str) -> bool:
+    """True for a '<region>_<fov>_<z>_<channel>' Cephla/Squid image stem."""
+    parts = stem.split("_", 3)
+    return len(parts) >= 4 and parts[1].isdigit() and parts[2].isdigit()
+
+
+def _pixel_size_from_params(params: dict) -> float:
+    """Microns per pixel from a Squid/Cephla ``acquisition parameters.json``.
+
+    Precedence:
+      1. an explicit ``pixel_size_um`` (e.g. written by cellscope-downsample so a
+         reduced-resolution copy reports its true effective pixel size);
+      2. ``sensor_pixel_size_um`` / *effective* magnification. The objective's
+         magnification is specified for its design tube-lens focal length
+         (``tube_lens_f_mm``); when the system uses a different tube lens
+         (``tube_lens_mm``), the effective magnification - and therefore the
+         pixel size - scales by that ratio. A nominal 20x objective on a 50 mm
+         tube lens instead of its 180 mm design images at 20*50/180 = 5.56x, so
+         the true pixel size is ~3.6x larger than the naive sensor/magnification;
+      3. 1.0 as a last resort.
+    """
+    explicit = params.get("pixel_size_um")
+    try:
+        if explicit and float(explicit) > 0:
+            return float(explicit)
+    except (TypeError, ValueError):
+        pass
+    sensor = params.get("sensor_pixel_size_um")
+    obj = params.get("objective") if isinstance(params.get("objective"), dict) else {}
+    mag = obj.get("magnification") or params.get("magnification")
+    try:
+        if sensor and mag:
+            eff_mag = float(mag)
+            tube_used = params.get("tube_lens_mm")
+            tube_design = obj.get("tube_lens_f_mm")
+            if tube_used and tube_design and float(tube_design) > 0:
+                eff_mag = float(mag) * float(tube_used) / float(tube_design)
+            if eff_mag > 0:
+                return float(sensor) / eff_mag
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    return 1.0
+
+
 @dataclass
 class _Position:
     region: str
@@ -77,11 +124,31 @@ class CephlaLoader(DatasetLoader):
         folder = Path(folder)
         if (folder / "acquisition parameters.json").exists():
             return True
-        if (folder / "coordinates.csv").exists() and any(
-            d.is_dir() and d.name.isdigit() for d in folder.iterdir()
-        ):
+        try:
+            entries = list(folder.iterdir())
+        except (OSError, ValueError):
+            return False
+        has_numbered = any(d.is_dir() and d.name.isdigit() for d in entries)
+        if (folder / "coordinates.csv").exists() and has_numbered:
             return True
-        return False
+        # Numbered timepoint subfolders that themselves hold Cephla-named images -
+        # some acquisitions store the metadata inside each timepoint folder rather
+        # than at the acquisition root, so the root has no json/csv to key off.
+        for d in entries:
+            if d.is_dir() and d.name.isdigit():
+                try:
+                    if any(_is_cephla_name(p.stem) for p in d.iterdir()
+                           if p.is_file() and p.suffix.lower() in (".tif", ".tiff")):
+                        return True
+                except OSError:
+                    continue
+        # A flat folder of Cephla-named images (region_fov_z_channel) with no
+        # numbered timepoint subfolders - e.g. a single downloaded timepoint.
+        # Require several matching files so ordinary folders aren't hijacked.
+        tiffs = [p for p in entries
+                 if p.is_file() and p.suffix.lower() in (".tif", ".tiff")]
+        cephla = sum(1 for p in tiffs if _is_cephla_name(p.stem))
+        return cephla >= 3 and cephla * 2 >= len(tiffs)
 
     def __init__(self, folder: str) -> None:
         self._folder = Path(folder)
@@ -90,13 +157,22 @@ class CephlaLoader(DatasetLoader):
         self._cache: "OrderedDict[str, np.ndarray]" = OrderedDict()
         self._cache_limit = 2  # positions are large; keep only a couple resident
 
-        # Timepoint folders, numerically ordered.
+        # Timepoint folders, numerically ordered. If there are none, treat this
+        # folder itself as a single timepoint when it holds Cephla-named images
+        # directly (a flat, single-timepoint export).
         self._timepoints = sorted(
             (d for d in self._folder.iterdir() if d.is_dir() and d.name.isdigit()),
             key=lambda d: int(d.name),
         )
         if not self._timepoints:
-            raise ValueError("No numbered timepoint folders found")
+            has_flat_images = any(
+                _is_cephla_name(p.stem) for p in self._folder.iterdir()
+                if p.is_file() and p.suffix.lower() in (".tif", ".tiff")
+            )
+            if has_flat_images:
+                self._timepoints = [self._folder]
+            else:
+                raise ValueError("No numbered timepoint folders or Cephla images found")
 
         params = self._read_params()
         self._pixel = self._compute_pixel_size(params)
@@ -120,43 +196,39 @@ class CephlaLoader(DatasetLoader):
         self._positions: dict[str, _Position] = {}
         self._wells: list[WellInfo] = []
         for r_idx, region in enumerate(regions):
-            for fov in fovs_by_region[region]:
+            for fov_idx, fov in enumerate(fovs_by_region[region]):
                 well_id = f"{region}-{fov}"
                 self._positions[well_id] = _Position(region, fov)
+                # FOV tokens are usually numeric, but non-numeric ones must not
+                # crash the whole load - fall back to the enumeration index.
+                try:
+                    col = int(fov)
+                except (TypeError, ValueError):
+                    col = fov_idx
                 self._wells.append(WellInfo(
-                    well_id=well_id, row=r_idx, col=int(fov),
+                    well_id=well_id, row=r_idx, col=col,
                     n_time=len(self._timepoints), n_z=len(z_values),
                     n_channels=len(channels), height=self._height, width=self._width,
                 ))
 
     # --- metadata ---------------------------------------------------------
     def _read_params(self) -> dict:
-        path = self._folder / "acquisition parameters.json"
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
+        # The metadata may sit with the images (inside a timepoint folder), at the
+        # acquisition root, or a level or two up. Search the timepoint folders
+        # first, then upward.
+        bases = list(self._timepoints or [])
+        bases += [self._folder, self._folder.parent, self._folder.parent.parent]
+        for base in bases:
+            path = base / "acquisition parameters.json"
+            if path.exists():
+                try:
+                    return json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+        return {}
 
     def _compute_pixel_size(self, params: dict) -> float:
-        # An explicit pixel_size_um wins (e.g. written by cellscope-downsample so
-        # a reduced-resolution copy reports its true effective pixel size).
-        explicit = params.get("pixel_size_um")
-        try:
-            if explicit and float(explicit) > 0:
-                return float(explicit)
-        except (TypeError, ValueError):
-            pass
-        sensor = params.get("sensor_pixel_size_um")
-        obj = params.get("objective") or {}
-        mag = obj.get("magnification") if isinstance(obj, dict) else None
-        if not mag:
-            mag = params.get("magnification")
-        try:
-            if sensor and mag:
-                return float(sensor) / float(mag)
-        except (TypeError, ValueError):
-            pass
-        return 1.0
+        return _pixel_size_from_params(params)
 
     def _scan(self, tp_folder: Path):
         regions: list[str] = []
@@ -278,10 +350,12 @@ class CephlaLoader(DatasetLoader):
                 for ci, chan in enumerate(self._channel_keys):
                     path = tp / f"{pos.region}_{pos.fov}_{z}_{chan}.tiff"
                     if not path.exists():
+                        logger.debug("missing plane, left blank: %s", path)
                         continue
                     try:
                         plane = tifffile.imread(str(path))
-                    except Exception:
+                    except Exception as exc:
+                        logger.warning("unreadable plane, left blank: %s (%s)", path, exc)
                         continue
                     if plane.ndim == 3:
                         plane = plane[..., 0]

@@ -15,7 +15,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from cellscope.analysis import AnalysisSettings, run_analysis  # noqa: E402
 from cellscope.analysis.segmentation import segment_frame  # noqa: E402
 from cellscope.data.mock import MockLoader  # noqa: E402
-from cellscope.render import compose_rgb  # noqa: E402
 
 
 def test_mock_dataset_shape():
@@ -90,6 +89,11 @@ def test_pixel_size_override_scales_measurements():
     f_base = sum(m.feret_diameter_um for m in base.measurements)
     f_dbl = sum(m.feret_diameter_um for m in doubled.measurements)
     assert abs(f_dbl / f_base - 2.0) < 0.01
+    # Every length metric scales linearly with the pixel size too.
+    for attr in ("length_major_um", "length_minor_um", "perimeter_um"):
+        b = sum(getattr(m, attr) for m in base.measurements)
+        d = sum(getattr(m, attr) for m in doubled.measurements)
+        assert b > 0 and abs(d / b - 2.0) < 0.01, (attr, b, d)
 
 
 def test_downsample_preserves_real_units():
@@ -147,13 +151,458 @@ def test_sensitivity_sign_stable_on_negative_data():
     assert 0 < (strict > 0).sum() < img.size
 
 
-def test_compose_rgb_handles_nan():
-    frame = np.zeros((1, 16, 16), dtype=np.float32)
-    frame[0, 4:12, 4:12] = 200.0
-    frame[0, 0, 0] = np.nan
-    rgb = compose_rgb(frame, [(255, 255, 255)], [True], 0.5, 0.5)
-    assert rgb.dtype == np.uint8
-    assert rgb.max() > 0  # one NaN pixel must not black out the channel
+def test_extended_metrics_present_and_sane():
+    loader = MockLoader(size=128, n_wells=1, n_time=3)
+    wa = run_analysis(loader, loader.list_wells()[0].well_id, AnalysisSettings())
+    n_chan = len(loader.channel_names)
+    assert wa.measurements
+    for m in wa.measurements:
+        # Morphometrics: major >= minor > 0, eccentricity in [0, 1), perimeter > 0.
+        assert m.length_major_um >= m.length_minor_um > 0, m
+        assert 0.0 <= m.eccentricity < 1.0 + 1e-9, m.eccentricity
+        assert m.perimeter_um > 0, m.perimeter_um
+        # Per-channel intensity stats, one value per channel, correctly ordered.
+        for stat in (m.mean_intensity, m.max_intensity, m.min_intensity, m.std_intensity):
+            assert len(stat) == n_chan, (len(stat), n_chan)
+        for c in range(n_chan):
+            assert m.min_intensity[c] <= m.mean_intensity[c] <= m.max_intensity[c], (c, m)
+            assert m.std_intensity[c] >= 0.0
+
+
+def test_parquet_exact_schema():
+    try:
+        import pyarrow.parquet as pq  # noqa: F401
+    except ImportError:
+        print("  (skipped parquet schema test: pyarrow not installed)")
+        return
+    import tempfile
+    from cellscope.export import parquet_columns, write_measurements_parquet
+
+    loader = MockLoader(size=96, n_wells=1, n_time=3, n_channels=2)
+    loader._channel_names = ["GFP", "Alexa Fluor 647"]
+    wid = loader.list_wells()[0].well_id
+    wa = run_analysis(loader, wid, AnalysisSettings())
+
+    # The first 18 columns are the fixed reference layout (a notebook built on
+    # that schema still reads by name); `fov` and `condition` are appended so the
+    # per-cell key (Dataset, Well, fov, Timepoint, Label) is unique across the
+    # FOVs pooled into a well (Label restarts at 1 per FOV).
+    reference18 = [
+        "Label", "Diameter (Equivalent) (um)", "Diameter (Feret) (um)",
+        "Length Major (um)", "Length Minor (um)", "Perimeter (um)",
+        "Intensity Mean (GFP)", "Intensity Mean (Alexa Fluor 647)",
+        "Intensity Max (GFP)", "Intensity Max (Alexa Fluor 647)",
+        "Intensity STD (GFP)", "Intensity STD (Alexa Fluor 647)",
+        "Intensity Min (GFP)", "Intensity Min (Alexa Fluor 647)",
+        "Eccentricity", "Dataset", "Timepoint", "Well",
+    ]
+    expected = reference18 + ["fov", "condition", "segment"]
+    cols = parquet_columns(loader.channel_names)
+    assert cols == expected, cols
+    # The reference schema must remain the exact 18-column prefix.
+    assert cols[:18] == reference18
+
+    with tempfile.TemporaryDirectory() as td:
+        path = str(Path(td) / "p.parquet")
+        n = write_measurements_parquet(path, [(wid, "ctrl", wa)], dataset="src.zarr")
+        assert n == len(wa.measurements)
+        t = pq.read_table(path)
+        assert t.schema.names == expected, t.schema.names
+        types = {nm: str(ty) for nm, ty in zip(t.schema.names, t.schema.types)}
+        assert types["Label"] == "int64" and types["Timepoint"] == "int64"
+        assert types["Dataset"] == "string" and types["Well"] == "string"
+        assert types["fov"] == "string" and types["condition"] == "string"
+        assert types["segment"] == "int64"
+        assert types["Eccentricity"] == "double"
+        # Timepoint is 0-based (unlike the tidy CSV's 1-based `time`).
+        assert min(t.column("Timepoint").to_pylist()) == 0
+        # Well is the region (FOV suffix stripped); demo wells have no FOV.
+        assert set(t.column("Well").to_pylist()) == {wid}
+        # condition is threaded through from the (well, condition, wa) item.
+        assert set(t.column("condition").to_pylist()) == {"ctrl"}
+        # A gap-free time course is one segment (0).
+        assert set(t.column("segment").to_pylist()) == {0}
+
+
+def test_provenance_and_device():
+    from cellscope.analysis import resolve_device
+    from cellscope.provenance import build_run_metadata
+
+    # resolve_device must never raise, even with no torch / no GPU.
+    off = resolve_device(False)
+    assert off["device"] == "cpu" and not off["fell_back"]
+    on = resolve_device(True)
+    assert on["device"] in ("cpu", "cuda", "mps") and "detail" in on
+
+    loader = MockLoader(size=64, n_wells=1, n_time=2)
+    wa = run_analysis(loader, loader.list_wells()[0].well_id, AnalysisSettings())
+    meta = build_run_metadata(
+        source="/data/exp", engine="cellpose", settings=wa.settings,
+        pixel_size_um=0.65, downsample=1, channel_names=loader.channel_names,
+        gpu=on, positions=["A1"], output_format="parquet",
+        created_utc="2026-07-16T00:00:00Z",
+    )
+    for key in ("cellscope_version", "engine", "gpu", "settings",
+                "pixel_size_um", "channel_names", "n_positions", "created_utc"):
+        assert key in meta, key
+    assert meta["engine"] == "cellpose" and meta["n_positions"] == 1
+
+
+def test_run_analysis_accepts_prefetched_array():
+    # Passing a prefetched array (batch overlaps disk I/O with compute) must give
+    # identical results to letting run_analysis load it.
+    loader = MockLoader(size=96, n_wells=1, n_time=2)
+    wid = loader.list_wells()[0].well_id
+    a = run_analysis(loader, wid, AnalysisSettings())
+    b = run_analysis(loader, wid, AnalysisSettings(),
+                     array=loader.get_well(wid, downsample=1))
+    assert a.n_tracks == b.n_tracks
+    assert len(a.measurements) == len(b.measurements)
+    assert abs(sum(m.area_um2 for m in a.measurements)
+               - sum(m.area_um2 for m in b.measurements)) < 1e-6
+
+
+def test_cephla_pixel_size_tube_lens_correction():
+    from cellscope.data.cephla_loader import _pixel_size_from_params
+    # Real Squid params: 20x nominal, but a 50 mm tube lens vs its 180 mm design
+    # => effective 5.56x => 1.85 / 5.56 = 0.333 um/px (matches acquisition.yaml).
+    params = {"sensor_pixel_size_um": 1.85, "tube_lens_mm": 50,
+              "objective": {"magnification": 20.0, "tube_lens_f_mm": 180.0}}
+    assert abs(_pixel_size_from_params(params) - 0.333) < 0.002
+    # No tube-lens info -> naive sensor / magnification.
+    assert abs(_pixel_size_from_params(
+        {"sensor_pixel_size_um": 1.85, "objective": {"magnification": 20.0}}) - 0.0925) < 1e-3
+    # Explicit pixel size always wins; missing data -> 1.0.
+    assert _pixel_size_from_params(
+        {"pixel_size_um": 0.5, "sensor_pixel_size_um": 1.85}) == 0.5
+    assert _pixel_size_from_params({}) == 1.0
+
+
+def test_cephla_flat_single_timepoint_folder():
+    import json
+    import tempfile
+
+    import tifffile
+    from cellscope.data.cephla_loader import CephlaLoader
+
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d)
+        # A flat, single-timepoint Cephla export: images + metadata together,
+        # no numbered timepoint subfolders (the layout a single download yields).
+        params = {"sensor_pixel_size_um": 1.85, "tube_lens_mm": 50,
+                  "objective": {"magnification": 20.0, "tube_lens_f_mm": 180.0}}
+        (p / "acquisition parameters.json").write_text(json.dumps(params))
+        img = np.full((80, 80), 120, dtype=np.uint16)
+        img[30:50, 30:50] = 4000
+        for region in ("H2", "H3"):
+            for fov in (0, 1):
+                for chan in ("Fluorescence_488_nm_Ex", "Fluorescence_638_nm_Ex"):
+                    tifffile.imwrite(str(p / f"{region}_{fov}_0_{chan}.tiff"), img)
+
+        assert CephlaLoader.looks_like(p) is True
+        ld = CephlaLoader(str(p))
+        assert ld.channel_names == ["488 nm", "638 nm"], ld.channel_names
+        assert abs(ld.pixel_size_um - 0.333) < 0.002, ld.pixel_size_um  # tube-lens corrected
+        assert sorted(w.well_id for w in ld.list_wells()) == ["H2-0", "H2-1", "H3-0", "H3-1"]
+        assert ld.get_well("H2-0").shape == (1, 1, 2, 80, 80)  # (T, Z, C, Y, X)
+
+    # A folder that is NOT Cephla-named must not be hijacked.
+    with tempfile.TemporaryDirectory() as d2:
+        p2 = Path(d2)
+        for name in ("photo.tif", "scan_a.tif", "img001.tif"):
+            tifffile.imwrite(str(p2 / name), np.zeros((8, 8), dtype=np.uint16))
+        assert CephlaLoader.looks_like(p2) is False
+
+
+def test_subpopulation_stats_pure_helpers():
+    from cellscope.stats import benjamini_hochberg, bimodality_coefficient, cliffs_delta
+    rng = np.random.default_rng(0)
+    bimodal = np.concatenate([rng.normal(0, 0.3, 400), rng.normal(6, 0.3, 400)])
+    unimodal = rng.normal(0, 1, 800)
+    assert bimodality_coefficient(bimodal) > 0.555
+    assert bimodality_coefficient(unimodal) < 0.555
+    assert cliffs_delta([5, 6, 7, 8], [1, 2, 3, 4]) == 1.0
+    assert cliffs_delta([1, 2, 3], [1, 2, 3]) == 0.0
+    # BH: monotone, never below the raw p, clipped to 1.
+    adj = benjamini_hochberg([0.01, 0.02, 0.03, 0.04])
+    assert adj == sorted(adj) and all(a >= r for a, r in zip(adj, [0.01, 0.02, 0.03, 0.04]))
+
+
+def test_subpopulation_stats_well_level():
+    try:
+        import pandas as pd
+        import scipy  # noqa: F401
+    except ImportError:
+        print("  (skipped subpopulation stats test: pandas/scipy not installed)")
+        return
+    from cellscope.stats import subpopulation_stats
+
+    rng = np.random.default_rng(1)
+    rows = []
+    # Two conditions, THREE wells each (biological replicates), two FOVs per well,
+    # five timepoints. Drug grows a responder subpopulation and ramps up; Vehicle
+    # stays flat. Cells persist across timepoints so trajectories are real.
+    w = 0
+    for cond, fmax in (("Drug", 0.45), ("Vehicle", 0.03)):
+        for _well in range(3):
+            well = f"W{w}"; w += 1
+            for fov in ("0", "1"):
+                n = 150
+                base = rng.lognormal(7.1, 0.4, n)
+                resp = rng.random(n) < fmax
+                for t in range(5):
+                    for c in range(n):
+                        rate = 0.28 if resp[c] else 0.01
+                        val = base[c] * (10 ** (rate * t)) * rng.lognormal(0, 0.12)
+                        rows.append((well, fov, cond, t, 0, c + 1, float(val)))
+    df = pd.DataFrame(rows, columns=["Well", "fov", "condition", "Timepoint",
+                                     "segment", "Label", "Intensity Mean (488 nm)"])
+    df["Dataset"] = "demo"
+    df["group"] = df["condition"]
+    thr = 10 ** np.mean([np.log10(df["Intensity Mean (488 nm)"].quantile(q))
+                         for q in (0.5, 0.95)])
+
+    rep = subpopulation_stats(df, "Intensity Mean (488 nm)", thr, group_col="group")
+    # The well is the replication unit (not the 45,000 cells) -> n=3 per condition.
+    assert rep["replication_unit"] == "well", rep["replication_unit"]
+    resp = rep["responder_pct_by_condition"]
+    assert resp["n_units"] == {"Drug": 3, "Vehicle": 3}, resp["n_units"]
+    assert resp["medians"]["Drug"] > resp["medians"]["Vehicle"] + 10
+    # Perfect separation of 3 vs 3 -> Cliff's delta 1 and the floor p-value 0.1.
+    pair = resp["pairwise"][0]
+    assert pair["cliffs_delta"] == 1.0
+    assert abs(pair["p_value"] - 0.1) < 1e-6, pair["p_value"]
+    # Trajectories exist and Drug ramps faster than Vehicle.
+    tr = rep["trajectory_slope_by_condition"]
+    assert tr["medians"]["Drug"] > tr["medians"]["Vehicle"]
+    assert rep["n_cells_with_trajectory"] > 0
+
+    # Single well per condition -> the unit drops to FOV with a loud caveat.
+    one = df[df["Well"].isin(["W0", "W3"])].copy()
+    rep1 = subpopulation_stats(one, "Intensity Mean (488 nm)", thr, group_col="group")
+    assert rep1["replication_unit"] == "fov"
+    assert rep1["replication_caveat"] and "technical" in rep1["replication_caveat"].lower()
+
+
+def test_analyze_report():
+    try:
+        import pandas as pd
+        import matplotlib  # noqa: F401
+        import pyarrow  # noqa: F401
+    except ImportError:
+        print("  (skipped analyze report test: pandas/matplotlib not installed)")
+        return
+    import os
+    import tempfile
+
+    from cellscope.analyze import run
+
+    with tempfile.TemporaryDirectory() as d:
+        rng = np.random.default_rng(0)
+        rows = []
+        # H2 grows a high-green subpopulation over time; H3 stays low.
+        for well, fmax in (("H2", 0.5), ("H3", 0.05)):
+            for t in range(3):
+                n = 500
+                resp = rng.random(n) < fmax * (t / 2.0)
+                green = np.where(resp, rng.lognormal(8.6, 0.3, n), rng.lognormal(7.2, 0.4, n))
+                for gv in green:
+                    rows.append((well, t, float(gv), 400.0, 9.0, 0.5))
+        pd.DataFrame(rows, columns=[
+            "Well", "Timepoint", "Intensity Mean (488 nm)",
+            "Intensity Mean (638 nm)", "Diameter (Equivalent) (um)", "Eccentricity"
+        ]).to_parquet(os.path.join(d, "m.parquet"))
+
+        info = run(os.path.join(d, "m.parquet"), os.path.join(d, "report"))
+        assert info["timepoints"] == [0, 1, 2]
+        assert info["responders"] > 0
+        for f in ("index.html", "responder_fraction.png",
+                  "group_timepoint_summary.csv", "responder_characteristics.csv"):
+            assert os.path.exists(os.path.join(d, "report", f)), f
+        # The subpopulation must be detected as larger in H2 than H3 at the last timepoint.
+        s = pd.read_csv(os.path.join(d, "report", "group_timepoint_summary.csv"))
+        last = s[s["Timepoint"] == 2].set_index("group")["pct_responders"]
+        assert last["H2"] > last["H3"] + 10, last.to_dict()
+
+
+def test_segment_map_marks_gaps():
+    from types import SimpleNamespace
+
+    from cellscope.export import segment_map
+
+    def wa(frames):
+        return SimpleNamespace(measurements=[SimpleNamespace(frame=f) for f in frames])
+
+    # A gap-free run is one segment.
+    assert segment_map(wa([0, 0, 1, 2, 2])) == {0: 0, 1: 0, 2: 0}
+    # A missing timepoint (3, then 5) starts a new segment - so grouping by
+    # (position, segment, Label) can't join a track across the gap.
+    m = segment_map(wa([0, 1, 3, 5, 6]))
+    assert m == {0: 0, 1: 0, 3: 1, 5: 2, 6: 2}, m
+    # Two cells the tracker split across a gap land in different segments.
+    assert m[3] != m[5]
+
+
+def test_qc_report():
+    try:
+        import pandas as pd
+        import pyarrow  # noqa: F401
+    except ImportError:
+        print("  (skipped qc test: pandas/pyarrow not installed)")
+        return
+    import os
+    import tempfile
+
+    from cellscope.qc import format_issues, qc_report
+
+    with tempfile.TemporaryDirectory() as d:
+        # A clean table: unique keys, no NaN/saturation, contiguous timepoints.
+        clean = pd.DataFrame({
+            "Dataset": ["ds"] * 6,
+            "Well": ["H2"] * 6,
+            "fov": ["0"] * 3 + ["1"] * 3,
+            "Timepoint": [0, 1, 2] * 2,
+            "Label": [1, 1, 1, 1, 1, 1],
+            "Intensity Mean (488 nm)": [100.0, 110.0, 120.0, 90.0, 95.0, 100.0],
+            "Intensity Max (488 nm)": [500.0, 510.0, 520.0, 490.0, 495.0, 500.0],
+        })
+        p_clean = os.path.join(d, "clean.parquet")
+        clean.to_parquet(p_clean)
+        rep = qc_report(p_clean, os.path.join(d, "qc_clean.json"))
+        assert rep["ok"], rep["issues"]
+        assert rep["duplicate_key_rows"] == 0
+        assert os.path.exists(os.path.join(d, "qc_clean.json"))
+        assert format_issues(rep) == "QC: no issues found."
+
+        # A corrupt table that mimics every silent failure mode at once:
+        #  * no 'fov' column -> (Well, Timepoint, Label) collides across FOVs,
+        #  * a NaN (missing/blank channel) intensity row,
+        #  * a saturated cell, and
+        #  * a gap in the timepoint sequence (0, 2 - missing 1).
+        bad = pd.DataFrame({
+            "Dataset": ["ds"] * 4,
+            "Well": ["H2", "H2", "H2", "H2"],
+            "Timepoint": [0, 0, 2, 2],
+            "Label": [1, 1, 2, 2],  # (Well, Timepoint, Label) duplicated -> collision
+            "Intensity Mean (488 nm)": [100.0, float("nan"), 120.0, 130.0],
+            "Intensity Max (488 nm)": [500.0, 510.0, 70000.0, 520.0],  # >saturation
+        })
+        p_bad = os.path.join(d, "bad.parquet")
+        bad.to_parquet(p_bad)
+        rep2 = qc_report(p_bad)
+        assert not rep2["ok"]
+        blob = " ".join(rep2["issues"]).lower()
+        assert "fov" in blob            # missing-fov key-collision warning
+        assert rep2["duplicate_key_rows"] > 0
+        assert "blank channel" in blob or "missing" in blob  # NaN intensity
+        assert "saturation" in blob     # saturated cell
+        assert "gap" in blob            # 0,2 timepoint gap
+        assert "QC:" in format_issues(rep2)
+
+        # Coverage matrix: 3 positions all reach TP0; only 1 reaches TP2 -> the
+        # under-covered timepoint must be reported as data and flagged.
+        cov = pd.DataFrame({
+            "Well": ["H2", "H2", "H3", "H2"],
+            "fov": ["0", "1", "0", "0"],
+            "Timepoint": [0, 0, 0, 2],
+            "Label": [1, 1, 1, 1],
+            "Intensity Mean (488 nm)": [100.0, 100.0, 100.0, 100.0],
+        })
+        p_cov = os.path.join(d, "cov.parquet")
+        cov.to_parquet(p_cov)
+        repc = qc_report(p_cov)
+        assert repc["positions"] == 3
+        assert repc["positions_per_timepoint"] == {0: 3, 2: 1}, repc["positions_per_timepoint"]
+        assert any("<50%" in m for m in repc["issues"]), repc["issues"]
+
+
+def test_fog_plot_script():
+    try:
+        import pandas as pd
+        import matplotlib  # noqa: F401
+        import pyarrow  # noqa: F401
+    except ImportError:
+        print("  (skipped fog_plot test: pandas/matplotlib/pyarrow not installed)")
+        return
+    import importlib.util
+    import os
+    import tempfile
+
+    fp_path = Path(__file__).resolve().parents[1] / "scripts" / "fog_plot.py"
+    spec = importlib.util.spec_from_file_location("fog_plot", fp_path)
+    fog = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fog)
+
+    # Case-insensitive column resolution (so --facet-by Condition finds condition).
+    df0 = pd.DataFrame({"Well": ["H2"], "condition": ["A"], "Timepoint": [0]})
+    assert fog._resolve_column(df0, "Condition") == "condition"
+    assert fog._resolve_column(df0, "nope") is None
+
+    # Non-positive counting (invisible on a log axis): zeros + negatives + NaN.
+    assert fog._count_nonpositive([1.0, 0.0, -3.0, float("nan"), 5.0]) == 3
+
+    with tempfile.TemporaryDirectory() as d:
+        # Uneven coverage: 3 positions (H2-0/H2-1/H3-0) all reach TP0, but only one
+        # reaches TP1 - the exact "partial late timepoint" trap.
+        rows = []
+        for (well, fov), tmax in {("H2", "0"): 1, ("H2", "1"): 0, ("H3", "0"): 0}.items():
+            for t in range(tmax + 1):
+                for _ in range(20):
+                    rows.append((well, fov, "Drug with a very long condition name",
+                                 t, 100.0 + t, 0.0 if _ == 0 else 500.0))
+        df = pd.DataFrame(rows, columns=[
+            "Well", "fov", "condition", "Timepoint",
+            "Intensity Mean (488 nm)", "Intensity Mean (638 nm)"])
+        p = os.path.join(d, "m.parquet")
+        df.to_parquet(p)
+
+        per, total = fog._coverage(df)
+        assert total == 3 and per == {0: 3, 1: 1}, (per, total)
+
+        # A channel with exact-zero cells (638) is flagged, not silently dropped.
+        assert fog._count_nonpositive(df["Intensity Mean (638 nm)"].to_numpy(float)) > 0
+
+        # Faceting by the (long-named, case-different) condition renders and exits 0.
+        out = os.path.join(d, "fog.png")
+        rc = fog.main([p, "-o", out, "--facet-by", "Condition",
+                       "--channel", "Intensity Mean (638 nm)", "--control",
+                       "Drug with a very long condition name"])
+        assert rc == 0 and os.path.exists(out)
+
+        # An unknown --facet-by errors loudly (exit 2) instead of silently pooling.
+        assert fog.main([p, "-o", out, "--facet-by", "Treatment"]) == 2
+        # An unknown --channel errors loudly too.
+        assert fog.main([p, "-o", out, "--channel", "Intensity Mean (999 nm)"]) == 2
+
+
+def test_cephla_multi_timepoint_folders():
+    import json
+    import tempfile
+
+    import tifffile
+    from cellscope.data.cephla_loader import CephlaLoader
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        params = {"sensor_pixel_size_um": 1.85, "tube_lens_mm": 50,
+                  "objective": {"magnification": 20.0, "tube_lens_f_mm": 180.0}}
+        img = np.full((72, 72), 120, dtype=np.uint16)
+        img[24:44, 24:44] = 4000
+        # Numbered timepoint folders, each with images + metadata inside (not at root).
+        for tp in ("0", "1", "7"):
+            sub = root / tp
+            sub.mkdir()
+            (sub / "acquisition parameters.json").write_text(json.dumps(params))
+            for region in ("H2", "H3"):
+                for chan in ("Fluorescence_488_nm_Ex", "Fluorescence_638_nm_Ex"):
+                    tifffile.imwrite(str(sub / f"{region}_0_0_{chan}.tiff"), img)
+
+        assert CephlaLoader.looks_like(root) is True
+        ld = CephlaLoader(str(root))
+        assert ld.channel_names == ["488 nm", "638 nm"]
+        assert abs(ld.pixel_size_um - 0.333) < 0.002  # metadata found inside a timepoint folder
+        # Three timepoint folders -> a 3-frame time axis.
+        assert ld.get_well("H2-0").shape[0] == 3
 
 
 def test_mock_small_size_ok():
@@ -180,7 +629,19 @@ if __name__ == "__main__":
     test_feret_diameter_of_known_shape()
     test_sensitivity_changes_detection()
     test_sensitivity_sign_stable_on_negative_data()
-    test_compose_rgb_handles_nan()
+    test_extended_metrics_present_and_sane()
+    test_parquet_exact_schema()
+    test_provenance_and_device()
+    test_run_analysis_accepts_prefetched_array()
+    test_cephla_pixel_size_tube_lens_correction()
+    test_cephla_flat_single_timepoint_folder()
+    test_cephla_multi_timepoint_folders()
+    test_segment_map_marks_gaps()
+    test_qc_report()
+    test_fog_plot_script()
+    test_subpopulation_stats_pure_helpers()
+    test_subpopulation_stats_well_level()
+    test_analyze_report()
     test_mock_small_size_ok()
     test_mock_rejects_tiny_size()
     print(f"All analysis checks passed in {time.time() - t0:.1f}s")

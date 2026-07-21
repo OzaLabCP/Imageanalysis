@@ -112,20 +112,21 @@ def _copy_metadata(in_dir: Path, out_dir: Path, factor: int) -> None:
 
 
 def _write_scaled_params(src: Path, dst: Path, factor: int) -> None:
+    from cellscope.data.cephla_loader import _pixel_size_from_params
     try:
         params = json.loads(src.read_text(encoding="utf-8"))
     except Exception:
         shutil.copy2(src, dst)
         return
-    base = params.get("pixel_size_um")
-    if not base:
-        sensor = params.get("sensor_pixel_size_um")
-        obj = params.get("objective") or {}
-        mag = (obj.get("magnification") if isinstance(obj, dict) else None) \
-            or params.get("magnification")
-        base = (float(sensor) / float(mag)) if (sensor and mag) else None
-    if base:
-        params["pixel_size_um"] = float(base) * factor  # honored by CephlaLoader
+    # Use the same tube-lens-corrected pixel size the loader would, so the
+    # reduced copy records the true effective micron scale (not sensor/mag).
+    obj = params.get("objective") if isinstance(params.get("objective"), dict) else {}
+    has_info = bool(params.get("pixel_size_um")) or bool(
+        params.get("sensor_pixel_size_um")
+        and (obj.get("magnification") or params.get("magnification"))
+    )
+    if has_info:
+        params["pixel_size_um"] = _pixel_size_from_params(params) * factor
     params["cellscope_downsample_factor"] = factor
     dst.write_text(json.dumps(params, indent=2), encoding="utf-8")
 

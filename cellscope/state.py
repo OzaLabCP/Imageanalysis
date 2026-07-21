@@ -286,6 +286,10 @@ class AppState(QObject):
             m.area_um2 *= ratio2
             m.equiv_diameter_um *= ratio
             m.feret_diameter_um *= ratio
+            m.length_major_um *= ratio
+            m.length_minor_um *= ratio
+            m.perimeter_um *= ratio
+            # eccentricity and intensity stats are scale-invariant.
         wa.pixel_size_um = new_px
 
     def set_pixel_size_um(self, value: float) -> None:

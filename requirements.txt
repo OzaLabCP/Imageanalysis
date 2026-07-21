@@ -5,5 +5,9 @@ scipy>=1.10
 tifffile>=2023.7     # TIFF / OME-TIFF / ImageJ hyperstack reading
 Pillow>=10.0         # JPG / PNG reading
 
+# Optional extras (installed via pip install "cellscope[...]"; see pyproject.toml):
+#   cellscope[cellpose]   cellpose>=4.0   GPU deep-learning segmentation
+#   cellscope[parquet]    pyarrow>=14     fixed-schema parquet output
+
 # Added in later milestones:
 # aicsimageio>=4.11   # ND2 (Nikon), CZI (Zeiss)

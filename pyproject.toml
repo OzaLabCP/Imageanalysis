@@ -23,11 +23,19 @@ dependencies = [
 # install a CUDA build of torch first (see https://pytorch.org):
 #   pip install "cellscope[cellpose]"
 cellpose = ["cellpose>=4.0"]
+# Fixed-schema parquet output for cellscope-batch --format parquet:
+#   pip install "cellscope[parquet]"
+parquet = ["pyarrow>=14"]
+# Automated subpopulation analysis report (cellscope-analyze / --analyze) and
+# the plotting scripts:
+#   pip install "cellscope[analysis]"
+analysis = ["pandas>=2.0", "matplotlib>=3.7", "pyarrow>=14"]
 
 [project.scripts]
 cellscope = "cellscope.app:main"
 cellscope-batch = "cellscope.batch:main"
 cellscope-downsample = "cellscope.downsample:main"
+cellscope-analyze = "cellscope.analyze:main"
 
 [tool.setuptools.packages.find]
 include = ["cellscope*"]

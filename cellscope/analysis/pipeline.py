@@ -65,8 +65,15 @@ class CellMeasurement:
     area_um2: float
     equiv_diameter_um: float
     feret_diameter_um: float
+    length_major_um: float
+    length_minor_um: float
+    perimeter_um: float
+    eccentricity: float
     mean_intensity: list[float]
     total_intensity: list[float]
+    max_intensity: list[float]
+    std_intensity: list[float]
+    min_intensity: list[float]
 
 
 @dataclass
@@ -102,6 +109,7 @@ def run_analysis(
     progress_cb=None,
     pixel_size_um: float | None = None,
     downsample: int = 1,
+    array: np.ndarray | None = None,
 ) -> WellAnalysis:
     """Run the full pipeline for one well. ``progress_cb(percent)`` is optional.
 
@@ -109,6 +117,10 @@ def run_analysis(
     loader's value when given). ``downsample`` runs the analysis at 1/N
     resolution for speed; the effective pixel size is scaled by N so areas and
     diameters still come out in real microns.
+
+    ``array`` lets a caller pass an already-loaded ``(T, Z, C, Y, X)`` stack
+    (e.g. prefetched on another thread so disk I/O overlaps GPU compute); it must
+    have been loaded at the same ``downsample``. When omitted the loader reads it.
     """
 
     def report(pct: int) -> None:
@@ -120,7 +132,8 @@ def run_analysis(
     px_size = base_px * downsample  # effective microns per (preview) pixel
 
     report(1)
-    arr = loader.get_well(well_id, downsample=downsample)  # (T, Z, C, Y, X)
+    # (T, Z, C, Y, X) - prefetched by the caller, or read now.
+    arr = loader.get_well(well_id, downsample=downsample) if array is None else array
     n_time, n_z, n_chan, height, width = arr.shape
     z = int(np.clip(settings.z, 0, n_z - 1))
     seg_c = int(np.clip(settings.seg_channel, 0, n_chan - 1))
@@ -170,8 +183,15 @@ def run_analysis(
                     area_um2=m["area_um2"],
                     equiv_diameter_um=m["equiv_diameter_um"],
                     feret_diameter_um=m["feret_diameter_um"],
+                    length_major_um=m["length_major_um"],
+                    length_minor_um=m["length_minor_um"],
+                    perimeter_um=m["perimeter_um"],
+                    eccentricity=m["eccentricity"],
                     mean_intensity=m["mean_intensity"],
                     total_intensity=m["total_intensity"],
+                    max_intensity=m["max_intensity"],
+                    std_intensity=m["std_intensity"],
+                    min_intensity=m["min_intensity"],
                 )
             )
         report(64 + int(34 * (t + 1) / n_time))  # 64..98

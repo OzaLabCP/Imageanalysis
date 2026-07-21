@@ -38,6 +38,16 @@ def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     theme.apply_theme(app, "light")
 
+    # compose_rgb pulls in Qt (QImage), so it lives here rather than in the
+    # Qt-free analysis suite. A NaN pixel must not black out the whole channel.
+    from cellscope.render import compose_rgb
+    nan_frame = np.zeros((1, 16, 16), dtype=np.float32)
+    nan_frame[0, 4:12, 4:12] = 200.0
+    nan_frame[0, 0, 0] = np.nan
+    rgb = compose_rgb(nan_frame, [(255, 255, 255)], [True], 0.5, 0.5)
+    assert rgb.dtype == np.uint8 and rgb.max() > 0
+    print("[ok] compose_rgb tolerates NaN pixels")
+
     from cellscope.app import MainWindow
 
     window = MainWindow()
@@ -98,15 +108,21 @@ def main() -> int:
     assert results._chart._series, "chart has no series"
     print(f"[ok] results table has {results._table.rowCount()} rows")
 
-    # Ruler calibration rescales existing measurements (area x4, diameter x2).
+    # Ruler calibration rescales existing measurements (area x4, lengths x2).
     a_before = sum(m.area_um2 for m in wa.measurements)
     f_before = sum(m.feret_diameter_um for m in wa.measurements)
+    p_before = sum(m.perimeter_um for m in wa.measurements)
+    maj_before = sum(m.length_major_um for m in wa.measurements)
     state.set_pixel_size_um(state.pixel_size_um * 2.0)
     a_after = sum(m.area_um2 for m in wa.measurements)
     f_after = sum(m.feret_diameter_um for m in wa.measurements)
+    p_after = sum(m.perimeter_um for m in wa.measurements)
+    maj_after = sum(m.length_major_um for m in wa.measurements)
     assert abs(a_after / a_before - 4.0) < 0.01, (a_before, a_after)
     assert abs(f_after / f_before - 2.0) < 0.01, (f_before, f_after)
-    print("[ok] ruler calibration rescaled measurements (area x4, diameter x2)")
+    assert abs(p_after / p_before - 2.0) < 0.01, (p_before, p_after)
+    assert abs(maj_after / maj_before - 2.0) < 0.01, (maj_before, maj_after)
+    print("[ok] ruler calibration rescaled measurements (area x4, lengths x2)")
 
     # Race: calibrate WHILE an analysis is in flight. done() must reconcile the
     # freshly-computed result to the current scale. Deterministic because the
