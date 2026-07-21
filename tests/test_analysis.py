@@ -384,6 +384,64 @@ def test_subpopulation_stats_well_level():
     assert rep1["replication_caveat"] and "technical" in rep1["replication_caveat"].lower()
 
 
+def test_xlsx_report():
+    try:
+        import pandas as pd
+        import openpyxl
+        import pyarrow  # noqa: F401
+    except ImportError:
+        print("  (skipped xlsx test: pandas/openpyxl/pyarrow not installed)")
+        return
+    import os
+    import tempfile
+
+    from cellscope.xlsx_report import build_workbook
+
+    with tempfile.TemporaryDirectory() as d:
+        rng = np.random.default_rng(1)
+        rows = []
+        for cond, fmax in (("Drug", 0.45), ("Vehicle", 0.03)):
+            for wi in range(2):
+                well = f"{cond[0]}{wi}"
+                n = 120
+                base = rng.lognormal(7.1, 0.4, n)
+                resp = rng.random(n) < fmax
+                for t in range(4):
+                    for c in range(n):
+                        val = base[c] * (10 ** ((0.28 if resp[c] else 0.01) * t))
+                        rows.append((well, "0", cond, t, 0, c + 1, float(val), 9.0, 0.5))
+        df = pd.DataFrame(rows, columns=["Well", "fov", "condition", "Timepoint",
+            "segment", "Label", "Intensity Mean (488 nm)",
+            "Diameter (Equivalent) (um)", "Eccentricity"])
+        df["Dataset"] = "demo"
+        p = os.path.join(d, "m.parquet"); df.to_parquet(p)
+        out = os.path.join(d, "report.xlsx")
+        info = build_workbook(p, out)
+        assert os.path.exists(out)
+
+        wb = openpyxl.load_workbook(out)
+        for s in ("Settings", "Cells", "ResponderPct", "MeanGreen", "PerWell", "Charts"):
+            assert s in wb.sheetnames, wb.sheetnames
+        assert len(wb["Charts"]._charts) == 3  # two line charts + one bar
+        # Formulas are live: they reference the editable threshold cell, not a value.
+        f = wb["ResponderPct"]["B3"].value
+        assert f.startswith("=") and "COUNTIFS" in f and "Settings!$B$4" in f
+
+        # Correctness: the COUNTIFS the formula performs, evaluated on the Cells-sheet
+        # data, must equal the intended pandas responder fraction (openpyxl can't give
+        # cached values without Excel/LibreOffice, so we verify the logic directly).
+        cells = pd.DataFrame(wb["Cells"].iter_rows(min_row=2, values_only=True),
+                             columns=["Condition", "Well", "Timepoint", "Green"])
+        thr = wb["Settings"]["B4"].value
+        for cond in ("Drug", "Vehicle"):
+            for t in range(4):
+                sub = cells[(cells.Condition == cond) & (cells.Timepoint == t)]
+                formula_val = (sub.Green > thr).mean()
+                src = df[(df.condition == cond) & (df.Timepoint == t)]
+                intended = (src["Intensity Mean (488 nm)"] > thr).mean()
+                assert abs(formula_val - intended) < 1e-9, (cond, t)
+
+
 def test_analyze_report():
     try:
         import pandas as pd
@@ -641,6 +699,7 @@ if __name__ == "__main__":
     test_fog_plot_script()
     test_subpopulation_stats_pure_helpers()
     test_subpopulation_stats_well_level()
+    test_xlsx_report()
     test_analyze_report()
     test_mock_small_size_ok()
     test_mock_rejects_tiny_size()

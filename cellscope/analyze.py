@@ -344,8 +344,11 @@ def _fig_superplot(df, channel, thr, stat, out):
 
 
 def run(parquet, outdir, platemap=None, channel=GREEN_DEFAULT,
-        min_diameter=6.0, max_eccentricity=0.95):
-    """Generate the full report into ``outdir``. Returns a summary dict."""
+        min_diameter=6.0, max_eccentricity=0.95, xlsx=False):
+    """Generate the full report into ``outdir``. Returns a summary dict.
+
+    ``xlsx=True`` also writes ``report.xlsx`` - an interactive Excel workbook with
+    live formulas and native charts (needs ``openpyxl``)."""
     import pandas as pd
     os.makedirs(outdir, exist_ok=True)
 
@@ -442,11 +445,25 @@ def run(parquet, outdir, platemap=None, channel=GREEN_DEFAULT,
     grouped = "well" if df["group"].astype(str).equals(df["Well"].astype(str)) else "condition"
     _write_html(outdir, parquet, channel, thr, len(raw), len(df), n_resp,
                 grouped, groups, tvals, summary, figs, qc, stat)
+
+    # Optional interactive Excel workbook (live formulas + native charts).
+    xlsx_path = None
+    if xlsx:
+        try:
+            from cellscope.xlsx_report import build_workbook
+            xlsx_path = os.path.join(outdir, "report.xlsx")
+            build_workbook(parquet, xlsx_path, channel=channel, platemap=platemap,
+                           threshold=thr, min_diameter=min_diameter,
+                           max_eccentricity=max_eccentricity)
+        except Exception as exc:  # noqa: BLE001 - the xlsx must not break the report
+            print(f"Excel workbook skipped: {exc}")
+            xlsx_path = None
+
     return {"cells_total": len(raw), "cells_gated": len(df), "responders": n_resp,
             "threshold": thr, "groups": groups, "timepoints": tvals,
             "qc_ok": (qc.get("ok") if qc else None),
             "qc_issues": (qc.get("issues") if qc else []),
-            "stats": stat}
+            "stats": stat, "xlsx": xlsx_path}
 
 
 def _stats_html(stat, esc):
@@ -550,6 +567,9 @@ def main(argv=None) -> int:
                     help="drop cells smaller than this (um) as debris")
     ap.add_argument("--max-eccentricity", type=float, default=0.95,
                     help="drop very elongated (likely merged) objects")
+    ap.add_argument("--xlsx", action="store_true",
+                    help="also write report.xlsx - an interactive Excel workbook with "
+                         "live formulas and native charts (needs openpyxl)")
     args = ap.parse_args(argv)
     try:
         import pandas  # noqa: F401
@@ -559,11 +579,14 @@ def main(argv=None) -> int:
               "pip install 'cellscope[analysis]'", flush=True)
         return 1
     info = run(args.parquet, args.out, platemap=args.platemap, channel=args.channel,
-               min_diameter=args.min_diameter, max_eccentricity=args.max_eccentricity)
+               min_diameter=args.min_diameter, max_eccentricity=args.max_eccentricity,
+               xlsx=args.xlsx)
     print(f"Report -> {os.path.join(args.out, 'index.html')}  "
           f"({info['cells_gated']:,} cells, {len(info['groups'])} groups, "
           f"{len(info['timepoints'])} timepoints, {info['responders']:,} responders)",
           flush=True)
+    if info.get("xlsx"):
+        print(f"Excel workbook -> {info['xlsx']}", flush=True)
     return 0
 
 

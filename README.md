@@ -318,6 +318,13 @@ report groups by well. The report (`report/index.html`) contains:
 - **Responder characterization** - how the high-green cells differ in size / red / shape.
 - **CSV summaries** (`group_timepoint_summary.csv`, `responder_characteristics.csv`)
   ready for Prism/R/Excel.
+- **Interactive Excel workbook** (`--xlsx` &rarr; `report.xlsx`) - not flat images:
+  the per-cell values live on a `Cells` sheet, every summary is a `COUNTIFS`/
+  `AVERAGEIFS` **formula**, and the responder threshold is one **editable cell** -
+  change it and every `% responder` figure and **native Excel chart** (responders
+  over time, mean over time, per-well bars) recomputes. Add `--xlsx` to
+  `cellscope-analyze` or `cellscope-batch --analyze` (needs `openpyxl`, in the
+  `analysis` extra).
 
 Per-cell **trajectories** (the ramp-rate metric) use the globally-unique cell id
 `(Dataset, Well, fov, segment, Label)` the schema now provides, built only within

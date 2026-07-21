@@ -204,6 +204,9 @@ def main(argv=None) -> int:
                          "(parquet only; needs pandas+matplotlib). Implies --combine.")
     ap.add_argument("--platemap", default=None,
                     help="CSV mapping Well->condition, used by --analyze")
+    ap.add_argument("--xlsx", action="store_true",
+                    help="with --analyze, also write an interactive Excel workbook "
+                         "(report.xlsx: live formulas + native charts; needs openpyxl)")
     ap.add_argument("--sensitivity", type=float, default=0.5)
     ap.add_argument("--smoothing", type=float, default=1.5)
     ap.add_argument("--min-size", type=int, default=25)
@@ -404,11 +407,14 @@ def main(argv=None) -> int:
         try:
             from cellscope.analyze import run as analyze_run
             report_dir = out_dir / "report"
-            info = analyze_run(str(combined_path), str(report_dir), platemap=args.platemap)
+            info = analyze_run(str(combined_path), str(report_dir),
+                               platemap=args.platemap, xlsx=args.xlsx)
             print(f"Analysis report -> {report_dir / 'index.html'}  "
                   f"({info['cells_gated']:,} cells, {len(info['groups'])} groups, "
                   f"{len(info['timepoints'])} timepoints, {info['responders']:,} responders)",
                   flush=True)
+            if info.get("xlsx"):
+                print(f"Excel workbook -> {info['xlsx']}", flush=True)
         except Exception as exc:  # noqa: BLE001 - a report failure must not fail the run
             print(f"Analysis report skipped: {exc}", file=sys.stderr)
     elif args.analyze and args.format != "parquet":
