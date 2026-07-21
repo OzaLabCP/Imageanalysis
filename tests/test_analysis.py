@@ -384,6 +384,123 @@ def test_subpopulation_stats_well_level():
     assert rep1["replication_caveat"] and "technical" in rep1["replication_caveat"].lower()
 
 
+def test_subpopulation_detection():
+    from cellscope.subpop import detect_subpopulation
+    rng = np.random.default_rng(0)
+    # Default = NO subpopulation: unimodal (incl. large n), skewed, tiny outliers.
+    assert not detect_subpopulation(10 ** rng.normal(3.0, 0.3, 5000))["detected"]
+    assert not detect_subpopulation(10 ** rng.normal(3.0, 0.3, 200000))["detected"]
+    assert not detect_subpopulation(rng.lognormal(7.0, 0.6, 20000))["detected"]
+    tiny = 10 ** np.concatenate([rng.normal(3.0, 0.3, 9900), rng.normal(4.5, 0.15, 100)])
+    assert not detect_subpopulation(tiny)["detected"]  # 1% outliers, below the 5% floor
+    # Real subpopulations ARE detected, with the right high fraction.
+    for frac in (0.5, 0.2, 0.08):
+        nhi = int(10000 * frac)
+        vals = 10 ** np.concatenate([rng.normal(3.0, 0.3, 10000 - nhi),
+                                     rng.normal(4.3, 0.3, nhi)])
+        r = detect_subpopulation(vals)
+        assert r["detected"], frac
+        assert abs(r["fraction_high"] - frac) < 0.05, (frac, r["fraction_high"])
+
+
+def test_analyze_reports_no_subpopulation_when_none():
+    try:
+        import pandas as pd
+        import matplotlib  # noqa: F401
+        import pyarrow  # noqa: F401
+    except ImportError:
+        print("  (skipped no-subpop test: deps not installed)")
+        return
+    import os
+    import tempfile
+
+    from cellscope.analyze import run
+
+    with tempfile.TemporaryDirectory() as d:
+        rng = np.random.default_rng(0)
+        rows = []
+        # Two conditions, both plain unimodal - NO subpopulation anywhere.
+        for well in ("H2", "H3"):
+            for t in range(3):
+                for gv in 10 ** rng.normal(3.0, 0.3, 800):
+                    rows.append((well, t, float(gv), 400.0, 9.0, 0.5))
+        pd.DataFrame(rows, columns=[
+            "Well", "Timepoint", "Intensity Mean (488 nm)",
+            "Intensity Mean (638 nm)", "Diameter (Equivalent) (um)", "Eccentricity"
+        ]).to_parquet(os.path.join(d, "m.parquet"))
+
+        info = run(os.path.join(d, "m.parquet"), os.path.join(d, "report"))
+        # The headline: no subpopulation is manufactured.
+        assert info["subpopulation_detected"] is False
+        assert info["threshold"] is None
+        assert info["high_mode_cells"] == 0
+        # Detection panel + distributions are shown; the quantification figures are NOT.
+        assert os.path.exists(os.path.join(d, "report", "subpopulation_detection.png"))
+        assert not os.path.exists(os.path.join(d, "report", "high_mode_fraction.png"))
+        assert not os.path.exists(os.path.join(d, "report", "subpopulation_superplot.png"))
+        # The report says so in words.
+        assert "No subpopulation detected" in \
+            open(os.path.join(d, "report", "index.html")).read()
+
+
+def test_xlsx_report():
+    try:
+        import pandas as pd
+        import openpyxl
+        import pyarrow  # noqa: F401
+    except ImportError:
+        print("  (skipped xlsx test: pandas/openpyxl/pyarrow not installed)")
+        return
+    import os
+    import tempfile
+
+    from cellscope.xlsx_report import build_workbook
+
+    with tempfile.TemporaryDirectory() as d:
+        rng = np.random.default_rng(1)
+        rows = []
+        for cond, fmax in (("Drug", 0.45), ("Vehicle", 0.03)):
+            for wi in range(2):
+                well = f"{cond[0]}{wi}"
+                n = 120
+                base = rng.lognormal(7.1, 0.4, n)
+                resp = rng.random(n) < fmax
+                for t in range(4):
+                    for c in range(n):
+                        val = base[c] * (10 ** ((0.28 if resp[c] else 0.01) * t))
+                        rows.append((well, "0", cond, t, 0, c + 1, float(val), 9.0, 0.5))
+        df = pd.DataFrame(rows, columns=["Well", "fov", "condition", "Timepoint",
+            "segment", "Label", "Intensity Mean (488 nm)",
+            "Diameter (Equivalent) (um)", "Eccentricity"])
+        df["Dataset"] = "demo"
+        p = os.path.join(d, "m.parquet"); df.to_parquet(p)
+        out = os.path.join(d, "report.xlsx")
+        info = build_workbook(p, out)
+        assert os.path.exists(out)
+
+        wb = openpyxl.load_workbook(out)
+        for s in ("Settings", "Cells", "HighModePct", "MeanGreen", "PerWell", "Charts"):
+            assert s in wb.sheetnames, wb.sheetnames
+        assert len(wb["Charts"]._charts) == 3  # two line charts + one bar
+        # Formulas are live: they reference the editable threshold cell, not a value.
+        f = wb["HighModePct"]["B3"].value
+        assert f.startswith("=") and "COUNTIFS" in f and "Settings!$B$4" in f
+
+        # Correctness: the COUNTIFS the formula performs, evaluated on the Cells-sheet
+        # data, must equal the intended pandas responder fraction (openpyxl can't give
+        # cached values without Excel/LibreOffice, so we verify the logic directly).
+        cells = pd.DataFrame(wb["Cells"].iter_rows(min_row=2, values_only=True),
+                             columns=["Condition", "Well", "Timepoint", "Green"])
+        thr = wb["Settings"]["B4"].value
+        for cond in ("Drug", "Vehicle"):
+            for t in range(4):
+                sub = cells[(cells.Condition == cond) & (cells.Timepoint == t)]
+                formula_val = (sub.Green > thr).mean()
+                src = df[(df.condition == cond) & (df.Timepoint == t)]
+                intended = (src["Intensity Mean (488 nm)"] > thr).mean()
+                assert abs(formula_val - intended) < 1e-9, (cond, t)
+
+
 def test_analyze_report():
     try:
         import pandas as pd
@@ -415,13 +532,16 @@ def test_analyze_report():
 
         info = run(os.path.join(d, "m.parquet"), os.path.join(d, "report"))
         assert info["timepoints"] == [0, 1, 2]
-        assert info["responders"] > 0
-        for f in ("index.html", "responder_fraction.png",
-                  "group_timepoint_summary.csv", "responder_characteristics.csv"):
+        # This data IS bimodal (a clear high mode in H2), so detection must fire and
+        # the subpopulation be quantified.
+        assert info["subpopulation_detected"] is True
+        assert info["high_mode_cells"] > 0
+        for f in ("index.html", "subpopulation_detection.png", "high_mode_fraction.png",
+                  "group_timepoint_summary.csv", "subpopulation_characteristics.csv"):
             assert os.path.exists(os.path.join(d, "report", f)), f
-        # The subpopulation must be detected as larger in H2 than H3 at the last timepoint.
+        # The high-intensity subpopulation must be larger in H2 than H3 at the end.
         s = pd.read_csv(os.path.join(d, "report", "group_timepoint_summary.csv"))
-        last = s[s["Timepoint"] == 2].set_index("group")["pct_responders"]
+        last = s[s["Timepoint"] == 2].set_index("group")["pct_high_mode"]
         assert last["H2"] > last["H3"] + 10, last.to_dict()
 
 
@@ -641,6 +761,9 @@ if __name__ == "__main__":
     test_fog_plot_script()
     test_subpopulation_stats_pure_helpers()
     test_subpopulation_stats_well_level()
+    test_subpopulation_detection()
+    test_analyze_reports_no_subpopulation_when_none()
+    test_xlsx_report()
     test_analyze_report()
     test_mock_small_size_ok()
     test_mock_rejects_tiny_size()

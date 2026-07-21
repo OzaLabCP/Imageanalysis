@@ -29,7 +29,7 @@ parquet = ["pyarrow>=14"]
 # Automated subpopulation analysis report (cellscope-analyze / --analyze) and
 # the plotting scripts:
 #   pip install "cellscope[analysis]"
-analysis = ["pandas>=2.0", "matplotlib>=3.7", "pyarrow>=14"]
+analysis = ["pandas>=2.0", "matplotlib>=3.7", "pyarrow>=14", "openpyxl>=3.1"]
 
 [project.scripts]
 cellscope = "cellscope.app:main"

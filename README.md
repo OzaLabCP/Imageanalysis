@@ -47,12 +47,14 @@ cellscope-batch "path/to/acquisition" -o results --engine cellpose --format parq
    channels, saturation, timepoint coverage) and writes `qc.json` + a summary.
 9. **Provenance** — writes `run_metadata.json`: git commit, engine, GPU, pixel
    size, downsample factor, and positions, so any run is reproducible and diffable.
-10. **Analyze** (`--analyze`) — gates cells, sets a data-driven responder threshold,
-    groups by condition (from the parquet or `--platemap`), and renders the report:
-    **fog plots** (per-cell intensity over time), a **well-level superplot with
-    proper statistics** (tested across wells, not cells — no pseudo-replication),
-    responder-fraction, distributions, percentile bands, per-cell ramp-rate
-    trajectories, CSV + JSON summaries, and an `index.html`.
+10. **Analyze** (`--analyze`) — groups by condition (from the parquet or
+    `--platemap`) and **detects** whether a subpopulation exists (default: no).
+    Renders the detection panel, fog plots, distributions, and percentile bands
+    always; and — only where a subpopulation is genuinely found — quantifies it: a
+    high-mode fraction over time, a **well-level superplot with proper statistics**
+    (tested across wells, not cells — no pseudo-replication), per-cell ramp-rate
+    trajectories, CSV + JSON summaries, an `index.html`, and (with `--xlsx`) an
+    interactive Excel workbook.
 
 **What lands in `results/`:**
 
@@ -63,9 +65,10 @@ results/
 ├─ qc.json                         # data-integrity report
 ├─ run_metadata.json               # exact provenance (code, GPU, pixel size, downsample)
 └─ report/
-   ├─ fog_over_time.png             # the fog plots
-   ├─ responder_fraction.png, distributions_over_time.png, percentile_bands.png, …
-   ├─ group_timepoint_summary.csv, responder_characteristics.csv
+   ├─ subpopulation_detection.png  # the headline: is there a subpopulation? (default no)
+   ├─ fog_over_time.png, distributions_over_time.png, percentile_bands.png
+   ├─ (if detected) high_mode_fraction.png, subpopulation_superplot.png, subpopulation_stats.json
+   ├─ group_timepoint_summary.csv, report.xlsx (with --xlsx)
    └─ index.html                    # open this
 ```
 
@@ -281,9 +284,10 @@ single figure. A clean run prints `QC: no issues found.`
 
 Turn any run's parquet into a comprehensive **subpopulation report** in one step
 (needs `pip install "cellscope[analysis]"`). It is aimed at *"is there a
-subpopulation that behaves differently - and better - in some conditions?"*, so it
-works at the population/distribution level (a responder subpopulation shows up as
-a second, high mode - not a shift in the mean).
+subpopulation that behaves differently - and better - in some conditions?"* - and
+its **default answer is no**: a subpopulation shows up as a genuine second (high)
+mode in the distribution, and the report only reports one when the data actually
+splits, rather than forcing a threshold onto every distribution.
 
 Run it automatically as part of a batch run, or standalone on an existing parquet:
 
@@ -297,27 +301,48 @@ Grouping by **condition** happens automatically when the parquet carries a
 `condition` column (the batch runner threads a plate map through, so a run
 acquired with one groups by condition with no extra step); `--platemap`
 (`well,condition` CSV, e.g. `H2,Drug A`) overrides it, and without either the
-report groups by well. The report (`report/index.html`) contains:
+report groups by well.
 
-- **Subpopulation statistics** (`subpopulation_stats.json`, `subpopulation_superplot.png`) -
-  the inferential answer. Cells are pooled into a per-well value and every test
-  runs **across wells, not cells**, so significance isn't faked by counting
-  thousands of correlated cells (pseudo-replication). Reports responder fraction,
-  median intensity, and **per-cell ramp rate** (trajectory slope) per condition,
-  with Mann-Whitney U / Kruskal-Wallis + BH-corrected pairwise tests, Cliff's delta
-  effect sizes, and bootstrap CIs. A **superplot** shows each well as a big dot
-  (the unit tested) over the faint cells. When only one well exists per condition
-  it drops to the FOV level and says so loudly (technical, not biological,
-  replicates); it also reports **bimodality** per group so a unimodal distribution
-  (where the responder gate is meaningless) is visible.
-- **Fog over time** - per group, one dot per cell, x = time, with the responder gate drawn.
-- **Distributions over time** - per-timepoint violins; two modes reveal a subpopulation.
-- **Responder fraction over time** - % of cells above a data-driven (Otsu-on-log)
-  gate, per group over time.
-- **Percentile bands** - median vs top decile (p90); a rising tail flags responders.
-- **Responder characterization** - how the high-green cells differ in size / red / shape.
-- **CSV summaries** (`group_timepoint_summary.csv`, `responder_characteristics.csv`)
-  ready for Prism/R/Excel.
+**Detection first - a subpopulation is not assumed.** The **default answer is
+"no subpopulation."** Each condition's intensity distribution is *tested* for a
+genuine second mode (`subpopulation_detection.png/json`): a 1- vs 2-component
+Gaussian fit compared by BIC, requiring a real density **valley** between the
+modes and a non-trivial (>= 5%) minority mode. Only where all three hold is a
+subpopulation reported - and quantified. A forced threshold (Otsu, a percentile)
+would split any distribution and manufacture "responders" from a single blob;
+this doesn't. The report (`report/index.html`) contains:
+
+- **Subpopulation detection** (`subpopulation_detection.png`) - per group: unimodal
+  (no subpopulation), or a detected high mode with the fitted model and the
+  **antimode** (the valley) drawn as the threshold. This is the headline.
+- **Fog over time**, **Distributions over time**, **Percentile bands** - the
+  assumption-free views, shown regardless (a threshold line appears only if one
+  was detected).
+
+Then, **only when a subpopulation is detected**, it is quantified:
+
+- **High-mode fraction over time** (`high_mode_fraction.png`) - % of cells in the
+  high-intensity mode, per group over time.
+- **Well-level statistics** (`subpopulation_stats.json`, `subpopulation_superplot.png`) -
+  cells pooled into a per-well value; every test runs **across wells, not cells**,
+  so significance isn't faked by counting correlated cells (pseudo-replication).
+  Compares high-mode fraction, median intensity, and **per-cell ramp rate**
+  (trajectory slope) with Mann-Whitney U / Kruskal-Wallis + BH pairwise, Cliff's
+  delta, and bootstrap CIs; the superplot shows each well as a big dot (the unit
+  tested). One well per condition drops to the FOV level with a loud "technical,
+  not biological" caveat.
+- **Characterization** (`subpopulation_characterization.png`,
+  `subpopulation_characteristics.csv`) - how the high-mode cells differ in size /
+  red / shape.
+- **CSV summary** (`group_timepoint_summary.csv`) - n, medians, percentiles, and
+  `pct_high_mode` (NaN when no subpopulation), ready for Prism/R/Excel.
+- **Interactive Excel workbook** (`--xlsx` &rarr; `report.xlsx`) - not flat images:
+  per-cell values on a `Cells` sheet, every summary a `COUNTIFS`/`AVERAGEIFS`
+  **formula**, and the high-mode threshold one **editable cell** - change it and
+  every % and **native Excel chart** recomputes. (When no subpopulation is
+  detected the workbook says so and the threshold is a manual, exploratory cut.)
+  Add `--xlsx` to `cellscope-analyze` or `cellscope-batch --analyze` (needs
+  `openpyxl`, in the `analysis` extra).
 
 Per-cell **trajectories** (the ramp-rate metric) use the globally-unique cell id
 `(Dataset, Well, fov, segment, Label)` the schema now provides, built only within
