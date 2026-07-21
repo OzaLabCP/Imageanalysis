@@ -2,19 +2,25 @@
 
 Turns an ``all_measurements.parquet`` (one row per cell per timepoint) into a
 self-contained report aimed at one question: **is there a subpopulation that
-behaves differently - and better - in some conditions?** Population-level, so it
-does not depend on single-cell tracking (the parquet pools FOV, so per-cell
-trajectories are not reconstructable).
+behaves differently - and better - in some conditions?**
+
+Crucially, the **default answer is no**. A subpopulation is *detected*, not
+assumed: the intensity distribution is tested for a genuine second mode
+(``subpop.detect_subpopulation``) and quantified only where one really exists. The
+old always-on Otsu "responder gate" is gone - it manufactured a split from any
+distribution, even a single blob.
 
 It writes, into an output folder:
+  * ``subpopulation_detection.png/json`` - per group: unimodal, or a detected high
+                                       mode (fitted model + the antimode threshold)
   * ``fog_over_time.png``            - per-group panels, one dot per cell, x=time
-  * ``distributions_over_time.png``  - per-group violins per timepoint (bimodality)
-  * ``responder_fraction.png``       - %% cells above a data-driven responder gate,
-                                       per group over time  (the headline figure)
-  * ``percentile_bands.png``         - median vs top-decile (p90) over time, per group
-  * ``responder_characterization.png`` - what responders are (size / red / shape)
-  * ``group_timepoint_summary.csv``  - n, medians, %%responders, percentiles
-  * ``responder_characteristics.csv``- responder vs non-responder metrics
+  * ``distributions_over_time.png``  - per-group violins per timepoint
+  * ``percentile_bands.png``         - median vs top-decile (p90) over time
+  * (only when a subpopulation is detected) ``high_mode_fraction.png``,
+    ``subpopulation_characterization.png``, ``subpopulation_superplot.png``,
+    ``subpopulation_stats.json``, ``subpopulation_characteristics.csv``
+  * ``group_timepoint_summary.csv``  - n, medians, percentiles, %%high-mode
+  * ``report.xlsx`` (with ``--xlsx``) - interactive workbook, live formulas + charts
   * ``index.html``                   - the figures + a short written summary
 
 Run standalone (``cellscope-analyze parquet -o report``) or automatically after a
@@ -146,7 +152,8 @@ def _fig_fog_over_time(df, channel, groups, tvals, thr, out):
         ax.scatter(x, sub[channel], s=3, c=_GREEN, alpha=0.05, linewidths=0, rasterized=True)
         med = sub.groupby("Timepoint")[channel].median()
         ax.plot([tpos[t] for t in med.index], med.values, color=_INK, lw=1.8, zorder=5)
-        ax.axhline(thr, color="#d1495b", lw=1.1, ls="--", zorder=4)
+        if thr is not None:
+            ax.axhline(thr, color="#d1495b", lw=1.1, ls="--", zorder=4)
         ax.set_yscale("log")
         ax.set_ylim(ylim)
         ax.set_xticks(range(len(tvals)))
@@ -157,7 +164,8 @@ def _fig_fog_over_time(df, channel, groups, tvals, thr, out):
         axes[k // ncol][k % ncol].axis("off")
     fig.supxlabel("Timepoint", color=_INK2)
     fig.supylabel(f"{channel} (log)", color=_INK2)
-    fig.suptitle("Per-cell green over time (dashed = responder gate)",
+    sub_note = " (dashed = subpopulation threshold)" if thr is not None else ""
+    fig.suptitle(f"Per-cell intensity over time{sub_note}",
                  color=_INK, fontsize=14, weight="bold", x=0.01, ha="left")
     fig.tight_layout(rect=(0.02, 0.02, 1, 0.96))
     fig.savefig(out, facecolor="white")
@@ -187,7 +195,8 @@ def _fig_distributions(df, channel, groups, tvals, thr, out):
                 b.set_edgecolor(_INK)
             if "cmedians" in vp:
                 vp["cmedians"].set_color(_INK)
-        ax.axhline(np.log10(thr), color="#d1495b", lw=1.1, ls="--")
+        if thr is not None:
+            ax.axhline(np.log10(thr), color="#d1495b", lw=1.1, ls="--")
         ax.set_xticks(positions)
         ax.set_xticklabels(tvals)
         _panel_title(ax, g)
@@ -209,11 +218,11 @@ def _fig_responder_fraction(frac, groups, tvals, out):
     fig, ax = plt.subplots(figsize=(9, 5.5), dpi=140)
     for g in groups:
         s = frac[frac["group"] == g].sort_values("Timepoint")
-        ax.plot(s["Timepoint"], s["pct_responders"], "-o", color=colors[g],
+        ax.plot(s["Timepoint"], s["pct_high_mode"], "-o", color=colors[g],
                 lw=2, ms=5, label=str(g))
     ax.set_xlabel("Timepoint", color=_INK2)
-    ax.set_ylabel("% cells above responder gate", color=_INK2)
-    ax.set_title("Responder subpopulation fraction over time, by group",
+    ax.set_ylabel("% cells in the high-intensity mode", color=_INK2)
+    ax.set_title("High-intensity subpopulation fraction over time, by group",
                  color=_INK, fontsize=14, weight="bold", loc="left")
     ax.set_xticks(tvals)
     ax.legend(frameon=False, fontsize=10, title="group")
@@ -249,14 +258,14 @@ def _fig_percentile_bands(df, channel, groups, tvals, out):
 def _fig_responder_characterization(df, channel, thr, out):
     import matplotlib.pyplot as plt
     df = df.copy()
-    df["responder"] = np.where(df[channel] > thr, "responder", "non-responder")
+    df["mode"] = np.where(df[channel] > thr, "high", "low")
     metrics = [m for m in ("Diameter (Equivalent) (um)", RED_DEFAULT, "Eccentricity")
                if m in df.columns]
     fig, axes = plt.subplots(1, len(metrics), figsize=(4.4 * len(metrics), 4.2), dpi=140,
                              squeeze=False)
-    order = ["non-responder", "responder"]
+    order = ["low", "high"]
     for ax, m in zip(axes[0], metrics):
-        data = [df[df["responder"] == r][m].dropna().to_numpy() for r in order]
+        data = [df[df["mode"] == r][m].dropna().to_numpy() for r in order]
         data = [d for d in data if d.size > 1]
         if data:
             vp = ax.violinplot(data, positions=range(len(data)), showmedians=True, showextrema=False)
@@ -269,7 +278,7 @@ def _fig_responder_characterization(df, channel, thr, out):
         ax.set_xticklabels(order, fontsize=9)
         ax.set_title(m, color=_INK, fontsize=10, weight="bold")
         _style(ax)
-    fig.suptitle("What are the responders? (green-gated vs the rest)",
+    fig.suptitle("What are the high-mode cells? (high vs low intensity)",
                  color=_INK, fontsize=13, weight="bold", x=0.01, ha="left")
     fig.tight_layout(rect=(0, 0, 1, 0.94))
     fig.savefig(out, facecolor="white")
@@ -330,8 +339,8 @@ def _fig_superplot(df, channel, thr, stat, out):
     _annotate_p(ax1, stat.get("median_intensity_by_condition"), groups)
     _style(ax1)
     ax2.set_xticks(range(len(groups))); ax2.set_xticklabels(groups)
-    ax2.set_ylabel(f"% responders at TP{tp}", color=_INK2)
-    ax2.set_title("Responder fraction (each dot = one well)",
+    ax2.set_ylabel(f"% in high-intensity mode at TP{tp}", color=_INK2)
+    ax2.set_title("High-mode fraction (each dot = one well)",
                   color=_INK, fontsize=10.5, weight="bold", loc="left")
     _annotate_p(ax2, stat.get("responder_pct_by_condition"), groups)
     _style(ax2)
@@ -341,6 +350,68 @@ def _fig_superplot(df, channel, thr, stat, out):
     fig.savefig(out, facecolor="white")
     plt.close(fig)
     return True
+
+
+def _detect(df, channel, tvals):
+    """Detection-first: test each group (and the pooled data) at the endpoint for a
+    genuine high-intensity subpopulation. The default is 'none'; a threshold (the
+    antimode between modes) is defined only when one is actually detected."""
+    from cellscope.subpop import detect_subpopulation
+    endpoint = int(tvals[-1])
+    end = df[df["Timepoint"] == endpoint]
+    per_group = {str(g): detect_subpopulation(sub[channel].to_numpy(float))
+                 for g, sub in end.groupby("group")}
+    pooled = detect_subpopulation(end[channel].to_numpy(float))
+    antimodes = [r["antimode"] for r in per_group.values() if r.get("detected")]
+    if pooled.get("detected"):
+        threshold = float(pooled["antimode"])
+    elif antimodes:
+        threshold = float(np.median(antimodes))
+    else:
+        threshold = None
+    return {"endpoint": endpoint, "pooled": pooled, "per_group": per_group,
+            "threshold": threshold, "any_detected": threshold is not None}
+
+
+def _fig_detection(df, channel, detection, out):
+    """Endpoint log-intensity histogram per group, with the fitted two-component
+    model and antimode drawn only where a subpopulation was actually detected -
+    shows WHY each group was called unimodal or bimodal."""
+    import math
+    import matplotlib.pyplot as plt
+    from cellscope.subpop import _em2, _normpdf
+    tp = detection["endpoint"]
+    groups = sorted(detection["per_group"].keys())
+    end = df[df["Timepoint"] == tp]
+    ncol = min(3, len(groups)); nrow = math.ceil(len(groups) / ncol)
+    fig, axes = plt.subplots(nrow, ncol, figsize=(4.7 * ncol, 3.3 * nrow), dpi=140,
+                             squeeze=False)
+    for k, g in enumerate(groups):
+        ax = axes[k // ncol][k % ncol]
+        r = detection["per_group"][g]
+        vals = end[end["group"] == g][channel].to_numpy(float)
+        vals = np.log10(vals[np.isfinite(vals) & (vals > 0)])
+        if vals.size:
+            ax.hist(vals, bins=40, color="#c9d8ea", edgecolor="white", density=True)
+        det = bool(r.get("detected"))
+        if det and vals.size:
+            w, m, s, _ = _em2(vals)
+            xs = np.linspace(vals.min(), vals.max(), 200)
+            ax.plot(xs, w[0] * _normpdf(xs, m[0], s[0]) + w[1] * _normpdf(xs, m[1], s[1]),
+                    color=_INK, lw=1.6)
+            ax.axvline(np.log10(r["antimode"]), color="#d1495b", lw=1.3, ls="--")
+        head = (f"{g}: SUBPOPULATION  ({100 * r['fraction_high']:.0f}% high)" if det
+                else f"{g}: {r.get('verdict', 'unimodal')}")
+        ax.set_title(head, color=(_GREEN if det else _INK2), fontsize=10.5,
+                     weight="bold", loc="left")
+        _style(ax); ax.set_yticks([])
+    for k in range(len(groups), nrow * ncol):
+        axes[k // ncol][k % ncol].axis("off")
+    fig.supxlabel(f"log10 {channel} at endpoint (TP{tp})", color=_INK2)
+    fig.suptitle("Is there a subpopulation? Default: no - flagged only on a real second mode",
+                 color=_INK, fontsize=13, weight="bold", x=.01, ha="left")
+    fig.tight_layout(rect=(0.01, 0.01, 1, 0.95))
+    fig.savefig(out, facecolor="white"); plt.close(fig)
 
 
 def run(parquet, outdir, platemap=None, channel=GREEN_DEFAULT,
@@ -363,88 +434,102 @@ def run(parquet, outdir, platemap=None, channel=GREEN_DEFAULT,
     except Exception:  # noqa: BLE001 - QC must never block the report
         qc = None
 
+    import json as _json
     raw, channel = _load(parquet, platemap, channel)
     df = _gate(raw, channel, min_diameter, max_eccentricity)
     groups = sorted(df["group"].unique())
-    tvals = sorted(df["Timepoint"].unique())
-    thr = _responder_threshold(df[channel])
+    tvals = sorted(int(t) for t in df["Timepoint"].unique())
 
-    # --- summary tables ---------------------------------------------------
-    df["responder"] = df[channel] > thr
+    # --- detection first: do NOT assume a subpopulation exists ------------
+    # Test the distribution for a genuine second mode; only when one is found is a
+    # threshold (the antimode) defined and the subpopulation quantified. This
+    # replaces the old always-on Otsu gate, which manufactured "responders" from
+    # any distribution, even a single unimodal blob.
+    detection = _detect(df, channel, tvals)
+    thr = detection["threshold"]          # None => no subpopulation detected
+    any_det = detection["any_detected"]
+    with open(os.path.join(outdir, "subpopulation_detection.json"), "w",
+              encoding="utf-8") as f:
+        _json.dump(detection, f, indent=2)
+
+    df["is_high"] = (df[channel] > thr) if thr is not None else False
+
+    # --- summary table (assumption-free; high-mode % only when detected) --
     rows = []
     for (g, t), sub in df.groupby(["group", "Timepoint"]):
-        rows.append({
-            "group": g, "Timepoint": t, "n": len(sub),
-            "median_green": float(sub[channel].median()),
-            "mean_green": float(sub[channel].mean()),
-            "p90_green": float(sub[channel].quantile(0.90)),
-            "pct_responders": 100.0 * float(sub["responder"].mean()),
-        })
+        row = {"group": g, "Timepoint": t, "n": len(sub),
+               "median_green": float(sub[channel].median()),
+               "mean_green": float(sub[channel].mean()),
+               "p90_green": float(sub[channel].quantile(0.90))}
+        row["pct_high_mode"] = (100.0 * float(sub["is_high"].mean())
+                                if thr is not None else float("nan"))
+        rows.append(row)
     summary = pd.DataFrame(rows).sort_values(["group", "Timepoint"])
     summary.to_csv(os.path.join(outdir, "group_timepoint_summary.csv"), index=False)
 
-    charac = (df.assign(responder=np.where(df["responder"], "responder", "non-responder"))
-                .groupby("responder")
-                .agg(n=(channel, "size"),
-                     median_green=(channel, "median"),
-                     median_diameter=("Diameter (Equivalent) (um)", "median")
-                     if "Diameter (Equivalent) (um)" in df.columns else (channel, "median"),
-                     median_red=(RED_DEFAULT, "median")
-                     if RED_DEFAULT in df.columns else (channel, "median"),
-                     median_ecc=("Eccentricity", "median")
-                     if "Eccentricity" in df.columns else (channel, "median")))
-    charac.to_csv(os.path.join(outdir, "responder_characteristics.csv"))
-
     # --- figures ----------------------------------------------------------
     figs = []
-    if len(tvals) > 1:
-        _fig_fog_over_time(df, channel, groups, tvals, thr,
-                           os.path.join(outdir, "fog_over_time.png"))
-        figs.append(("fog_over_time.png", "Per-cell green over time (dashed = responder gate)"))
+    _fig_detection(df, channel, detection,
+                   os.path.join(outdir, "subpopulation_detection.png"))
+    figs.append(("subpopulation_detection.png",
+                 "Subpopulation detection - default none, flagged only on a real second mode"))
+    multi = len(tvals) > 1
+    _fig_fog_over_time(df, channel, groups, tvals, thr,
+                       os.path.join(outdir, "fog_over_time.png"))
+    figs.append(("fog_over_time.png", "Per-cell intensity over time"
+                 + (" (dashed = subpopulation threshold)" if thr is not None else "")))
+    if multi:
         _fig_distributions(df, channel, groups, tvals, thr,
                            os.path.join(outdir, "distributions_over_time.png"))
         figs.append(("distributions_over_time.png",
-                     "Green distribution per timepoint - two modes reveal a subpopulation"))
-        _fig_responder_fraction(summary, groups, tvals,
-                                os.path.join(outdir, "responder_fraction.png"))
-        figs.append(("responder_fraction.png",
-                     "Responder fraction over time, by group (the headline)"))
+                     "Distribution per timepoint (a second mode = a subpopulation)"))
         _fig_percentile_bands(df, channel, groups, tvals,
                               os.path.join(outdir, "percentile_bands.png"))
         figs.append(("percentile_bands.png", "Median vs top-decile over time"))
-    else:
-        # single timepoint: fall back to a by-group fog + distributions
-        _fig_fog_over_time(df, channel, groups, tvals, thr,
-                           os.path.join(outdir, "fog_over_time.png"))
-        figs.append(("fog_over_time.png", "Per-cell green by group (single timepoint)"))
-    _fig_responder_characterization(df, channel, thr,
-                                    os.path.join(outdir, "responder_characterization.png"))
-    figs.append(("responder_characterization.png", "What the responders are"))
 
-    # --- inferential statistics (well-level, not cell-level) --------------
-    # The figures above are descriptive; this tests whether the differences are
-    # real, using the WELL as the replication unit (cells are pseudo-replicates).
+    # --- quantification: ONLY when a subpopulation was actually detected --
     stat = None
-    if len(groups) > 1:
-        try:
-            import json as _json
-            from cellscope.stats import subpopulation_stats
-            stat = subpopulation_stats(df, channel, thr, group_col="group")
-            with open(os.path.join(outdir, "subpopulation_stats.json"), "w",
-                      encoding="utf-8") as f:
-                _json.dump(stat, f, indent=2)
-            if _fig_superplot(df, channel, thr, stat,
-                              os.path.join(outdir, "subpopulation_superplot.png")):
-                figs.insert(0, ("subpopulation_superplot.png",
-                                "Well-level comparison (each big dot = one well, the unit tested)"))
-        except Exception as exc:  # noqa: BLE001 - stats must not break the report
-            stat = {"error": str(exc)}
+    if any_det:
+        charac = (df.assign(mode=np.where(df["is_high"], "high", "low"))
+                    .groupby("mode")
+                    .agg(n=(channel, "size"),
+                         median_green=(channel, "median"),
+                         median_diameter=("Diameter (Equivalent) (um)", "median")
+                         if "Diameter (Equivalent) (um)" in df.columns else (channel, "median"),
+                         median_red=(RED_DEFAULT, "median")
+                         if RED_DEFAULT in df.columns else (channel, "median"),
+                         median_ecc=("Eccentricity", "median")
+                         if "Eccentricity" in df.columns else (channel, "median")))
+        charac.to_csv(os.path.join(outdir, "subpopulation_characteristics.csv"))
+        if multi:
+            _fig_responder_fraction(summary, groups, tvals,
+                                    os.path.join(outdir, "high_mode_fraction.png"))
+            figs.append(("high_mode_fraction.png",
+                         "High-intensity subpopulation fraction over time, by group"))
+        _fig_responder_characterization(df, channel, thr,
+                                        os.path.join(outdir, "subpopulation_characterization.png"))
+        figs.append(("subpopulation_characterization.png", "What the high-mode cells are"))
+
+        # Inferential comparison, at the WELL level (cells are pseudo-replicates).
+        if len(groups) > 1:
+            try:
+                from cellscope.stats import subpopulation_stats
+                stat = subpopulation_stats(df, channel, thr, group_col="group")
+                with open(os.path.join(outdir, "subpopulation_stats.json"), "w",
+                          encoding="utf-8") as f:
+                    _json.dump(stat, f, indent=2)
+                if _fig_superplot(df, channel, thr, stat,
+                                  os.path.join(outdir, "subpopulation_superplot.png")):
+                    figs.insert(1, ("subpopulation_superplot.png",
+                                    "Well-level comparison (each big dot = one well, the unit tested)"))
+            except Exception as exc:  # noqa: BLE001 - stats must not break the report
+                stat = {"error": str(exc)}
 
     # --- html report ------------------------------------------------------
-    n_resp = int(df["responder"].sum())
+    n_high = int(df["is_high"].sum())
     grouped = "well" if df["group"].astype(str).equals(df["Well"].astype(str)) else "condition"
-    _write_html(outdir, parquet, channel, thr, len(raw), len(df), n_resp,
-                grouped, groups, tvals, summary, figs, qc, stat)
+    _write_html(outdir, parquet, channel, thr, len(raw), len(df), n_high,
+                grouped, groups, tvals, summary, figs, qc, stat, detection)
 
     # Optional interactive Excel workbook (live formulas + native charts).
     xlsx_path = None
@@ -453,14 +538,16 @@ def run(parquet, outdir, platemap=None, channel=GREEN_DEFAULT,
             from cellscope.xlsx_report import build_workbook
             xlsx_path = os.path.join(outdir, "report.xlsx")
             build_workbook(parquet, xlsx_path, channel=channel, platemap=platemap,
-                           threshold=thr, min_diameter=min_diameter,
+                           threshold=thr, detected=any_det, min_diameter=min_diameter,
                            max_eccentricity=max_eccentricity)
         except Exception as exc:  # noqa: BLE001 - the xlsx must not break the report
             print(f"Excel workbook skipped: {exc}")
             xlsx_path = None
 
-    return {"cells_total": len(raw), "cells_gated": len(df), "responders": n_resp,
+    return {"cells_total": len(raw), "cells_gated": len(df),
+            "subpopulation_detected": any_det, "high_mode_cells": n_high,
             "threshold": thr, "groups": groups, "timepoints": tvals,
+            "detection": detection,
             "qc_ok": (qc.get("ok") if qc else None),
             "qc_issues": (qc.get("issues") if qc else []),
             "stats": stat, "xlsx": xlsx_path}
@@ -498,7 +585,7 @@ def _stats_html(stat, esc):
                 f"<span style='color:#666'>({esc(b.get('test',''))})</span><br>"
                 f"<span style='color:#444'>{meds}</span></p>{tbl}{warn}")
 
-    body = (block("Responder fraction", stat.get("responder_pct_by_condition"))
+    body = (block("High-mode fraction", stat.get("responder_pct_by_condition"))
             + block("Median intensity", stat.get("median_intensity_by_condition"))
             + block("Ramp rate (trajectory slope)", stat.get("trajectory_slope_by_condition")))
     notes = "".join(f"<li>{esc(n)}</li>" for n in stat.get("notes", []))
@@ -507,23 +594,44 @@ def _stats_html(stat, esc):
             f"padding:8px 12px;margin:10px 0'>{head}{body}{notes}</div>")
 
 
-def _write_html(outdir, parquet, channel, thr, n_raw, n_gated, n_resp,
-                grouped, groups, tvals, summary, figs, qc=None, stat=None):
+def _write_html(outdir, parquet, channel, thr, n_raw, n_gated, n_high,
+                grouped, groups, tvals, summary, figs, qc=None, stat=None,
+                detection=None):
     import pandas as pd  # noqa: F401
     esc = html.escape
     parts = [
         "<h1>CellScope subpopulation report</h1>",
         f"<p><b>Source:</b> {esc(os.path.basename(parquet))} &middot; "
         f"grouped by <b>{grouped}</b> ({esc(', '.join(map(str, groups)))}) &middot; "
-        f"{len(tvals)} timepoint(s)</p>",
-        f"<p><b>Cells:</b> {n_raw:,} measured &rarr; {n_gated:,} after gating &middot; "
-        f"<b>Responder gate</b> (Otsu on log green): {esc(channel)} &gt; {thr:,.0f} "
-        f"&middot; {n_resp:,} responders ({100.0*n_resp/max(1,n_gated):.1f}%)</p>",
-        "<p style='color:#666'>A subpopulation shows up as a second (high) mode in the "
-        "distribution and as a rising responder fraction / top decile in some groups but "
-        "not others. Significance is tested per well (see Statistics), and per-cell ramp "
-        "rates use the tracked-cell trajectories the schema now supports.</p>",
+        f"{len(tvals)} timepoint(s) &middot; channel {esc(channel)}</p>",
+        f"<p><b>Cells:</b> {n_raw:,} measured &rarr; {n_gated:,} after gating.</p>",
     ]
+    # Detection banner - the headline. Default is 'no subpopulation'; a high mode
+    # is reported only where the distribution genuinely splits into two.
+    if detection is not None:
+        det_groups = [g for g, r in detection.get("per_group", {}).items()
+                      if r.get("detected")]
+        if det_groups:
+            frac = (f"{100.0*n_high/max(1,n_gated):.1f}% of cells sit in a high-intensity "
+                    f"mode (above {thr:,.0f})" if thr is not None else "")
+            parts.append(
+                "<div style='background:#e8f5e9;border:1px solid #a5d6a7;border-radius:6px;"
+                "padding:8px 12px;margin:10px 0;color:#1b5e20'>"
+                f"<b>Subpopulation detected</b> in: {esc(', '.join(det_groups))}. {frac}. "
+                "Quantified below.</div>")
+        else:
+            parts.append(
+                "<div style='background:#eef2f7;border:1px solid #c7d2de;border-radius:6px;"
+                "padding:8px 12px;margin:10px 0;color:#3a4a5a'>"
+                "<b>No subpopulation detected.</b> Every condition's intensity distribution "
+                "is unimodal - no genuine second mode - so no threshold is imposed and no "
+                "'responder' fraction is manufactured. The distribution views below are "
+                "shown for inspection.</div>")
+    parts.append(
+        "<p style='color:#666'>A subpopulation is called only when the distribution shows "
+        "two genuinely separated modes (see the detection panel). When one exists it is "
+        "quantified: its size over time, what the high-mode cells are, and a per-well "
+        "comparison across conditions (significance tested per well, not per cell).</p>")
     # QC banner: green if clean, amber with the specific issues if not. Silent
     # data corruption is the failure mode this whole exercise exists to catch, so
     # it belongs at the top of the report, not buried in a sidecar file.
@@ -581,10 +689,12 @@ def main(argv=None) -> int:
     info = run(args.parquet, args.out, platemap=args.platemap, channel=args.channel,
                min_diameter=args.min_diameter, max_eccentricity=args.max_eccentricity,
                xlsx=args.xlsx)
+    det = info.get("subpopulation_detected")
+    verdict = (f"subpopulation detected ({info['high_mode_cells']:,} high-mode cells)"
+               if det else "no subpopulation detected")
     print(f"Report -> {os.path.join(args.out, 'index.html')}  "
           f"({info['cells_gated']:,} cells, {len(info['groups'])} groups, "
-          f"{len(info['timepoints'])} timepoints, {info['responders']:,} responders)",
-          flush=True)
+          f"{len(info['timepoints'])} timepoints, {verdict})", flush=True)
     if info.get("xlsx"):
         print(f"Excel workbook -> {info['xlsx']}", flush=True)
     return 0

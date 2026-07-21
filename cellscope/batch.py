@@ -409,10 +409,11 @@ def main(argv=None) -> int:
             report_dir = out_dir / "report"
             info = analyze_run(str(combined_path), str(report_dir),
                                platemap=args.platemap, xlsx=args.xlsx)
+            verdict = ("subpopulation detected" if info.get("subpopulation_detected")
+                       else "no subpopulation detected")
             print(f"Analysis report -> {report_dir / 'index.html'}  "
                   f"({info['cells_gated']:,} cells, {len(info['groups'])} groups, "
-                  f"{len(info['timepoints'])} timepoints, {info['responders']:,} responders)",
-                  flush=True)
+                  f"{len(info['timepoints'])} timepoints, {verdict})", flush=True)
             if info.get("xlsx"):
                 print(f"Excel workbook -> {info['xlsx']}", flush=True)
         except Exception as exc:  # noqa: BLE001 - a report failure must not fail the run

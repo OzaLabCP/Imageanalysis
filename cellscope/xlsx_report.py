@@ -3,18 +3,18 @@
 Unlike the PNG figures (flat, standalone artifacts), this writes an ``.xlsx`` with
 **live formulas** and **native Excel charts**: the per-cell values live on a data
 sheet, every summary number is a ``COUNTIFS``/``AVERAGEIFS`` formula, and the
-responder threshold is a single editable cell - change it and every ``% responder``
+high-mode threshold is a single editable cell - change it and every ``% high mode``
 figure and every chart recomputes. The charts are real Excel chart objects, so
 they can be restyled, hovered, and pasted into a paper, not exported images.
 
 Sheets
 ------
-* **Settings**    - editable responder threshold + endpoint timepoint (yellow).
+* **Settings**    - editable high-mode threshold + endpoint timepoint (yellow).
 * **Cells**       - the raw per-cell rows the formulas read (condition, well,
                     timepoint, intensity).
-* **ResponderPct**- %% responders per condition x timepoint (live formulas).
+* **HighModePct** - %% cells in the high-intensity mode per condition x timepoint.
 * **MeanGreen**   - mean intensity per condition x timepoint (live formulas).
-* **PerWell**     - %% responders per well at the endpoint (the honest unit).
+* **PerWell**     - %% in the high mode per well at the endpoint (the honest unit).
 * **Charts**      - native line + bar charts referencing the sheets above.
 
 Needs ``openpyxl`` (the ``analysis`` extra).
@@ -35,8 +35,13 @@ def _col(idx: int) -> str:
 
 
 def build_workbook(parquet, out_xlsx, channel=None, platemap=None, threshold=None,
-                   min_diameter=6.0, max_eccentricity=0.95):
-    """Write an interactive Excel report. Returns a small summary dict."""
+                   detected=None, min_diameter=6.0, max_eccentricity=0.95):
+    """Write an interactive Excel report. Returns a small summary dict.
+
+    ``threshold`` is the high-mode cut (the detected antimode). When it is None a
+    fallback cut is used and, if ``detected`` is False, the workbook says plainly
+    that no subpopulation was detected and the threshold is a manual exploratory
+    cut - it does not assert a subpopulation exists."""
     import numpy as np
     from openpyxl import Workbook
     from openpyxl.chart import BarChart, LineChart, Reference
@@ -82,7 +87,7 @@ def build_workbook(parquet, out_xlsx, channel=None, platemap=None, threshold=Non
     st["A1"] = "CellScope interactive report"; st["A1"].font = title
     rows = [
         ("Setting", "Value"),
-        ("Responder threshold (intensity)", round(threshold, 2)),
+        ("High-mode threshold (intensity)", round(threshold, 2)),
         ("Channel", channel),
         ("Endpoint timepoint", endpoint),
     ]
@@ -91,8 +96,15 @@ def build_workbook(parquet, out_xlsx, channel=None, platemap=None, threshold=Non
     st["A3"].font = st["B3"].font = hdr
     for c in ("B4", "B6"):  # threshold + endpoint are the editable levers
         st[c].fill = edit_fill
-    st["A8"] = ("Yellow cells are editable. Change the threshold or endpoint and "
-                "every % responder figure and chart below updates automatically.")
+    if detected is False:
+        st["A8"] = ("NOTE: no distinct subpopulation was detected - the intensity "
+                    "distribution is unimodal. The threshold above is a manual, "
+                    "exploratory cut (not a detected antimode); the '% high mode' "
+                    "figures below only mean something if you believe a subpopulation "
+                    "exists. Yellow cells are editable and everything recomputes live.")
+    else:
+        st["A8"] = ("Yellow cells are editable (the detected high-mode threshold and the "
+                    "endpoint). Change either and every % and chart below recomputes live.")
     st["A8"].alignment = Alignment(wrap_text=True)
     st.column_dimensions["A"].width = 34
     st.column_dimensions["B"].width = 22
@@ -142,15 +154,15 @@ def build_workbook(parquet, out_xlsx, channel=None, platemap=None, threshold=Non
         ws.column_dimensions["A"].width = 12
         return ws, 2, 2 + len(groups) - 1, 3, 2 + len(tvals)
 
-    rp, c0, c1, r0, r1 = _matrix("ResponderPct",
-                                 "% responders by condition over time (live)", "pct")
+    rp, c0, c1, r0, r1 = _matrix("HighModePct",
+                                 "% in high-intensity mode by condition over time (live)", "pct")
     mg, *_ = _matrix("MeanGreen", "Mean intensity by condition over time (live)", "mean")
 
     # --- PerWell (the unit that is honestly n) ----------------------------
     pw = wb.create_sheet("PerWell")
-    pw["A1"] = "% responders per well at endpoint (each row = one well)"
+    pw["A1"] = "% in high-intensity mode per well at endpoint (each row = one well)"
     pw["A1"].font = title
-    pw["A2"] = "Well"; pw["B2"] = "Condition"; pw["C2"] = "% responders (endpoint)"
+    pw["A2"] = "Well"; pw["B2"] = "Condition"; pw["C2"] = "% high mode (endpoint)"
     for c in (pw["A2"], pw["B2"], pw["C2"]):
         c.font = hdr
     for i, (well, cond) in enumerate(wells):
@@ -178,11 +190,11 @@ def build_workbook(parquet, out_xlsx, channel=None, platemap=None, threshold=Non
         c.set_categories(cats)
         ch.add_chart(c, anchor)
 
-    _line("A1", rp, "% responders over time", "% responders")
+    _line("A1", rp, "% in high-intensity mode over time", "% high mode")
     _line("A19", mg, "Mean intensity over time", f"mean {channel}")
 
-    bar = BarChart(); bar.title = "% responders per well (endpoint)"; bar.style = 10
-    bar.y_axis.title = "% responders"; bar.x_axis.title = "Well"
+    bar = BarChart(); bar.title = "% in high mode per well (endpoint)"; bar.style = 10
+    bar.y_axis.title = "% high mode"; bar.x_axis.title = "Well"
     bar.height, bar.width = 8.5, 16
     bdata = Reference(pw, min_col=3, min_row=2, max_row=pw_last)
     bcats = Reference(pw, min_col=1, min_row=3, max_row=pw_last)
